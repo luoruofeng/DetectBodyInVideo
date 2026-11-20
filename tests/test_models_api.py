@@ -94,6 +94,16 @@ def test_models_api(video_settings: Settings, monkeypatch: pytest.MonkeyPatch) -
         "download_model",
         lambda url, destination, **kwargs: destination.write_bytes(b"x") or destination,
     )
+    # 只认本测试的数据目录，避免仓库 models/ 里已有的模型让 poseReady 预置为 True
+    monkeypatch.setattr(
+        model_downloads,
+        "find_model",
+        lambda filename, settings=None: (
+            candidate
+            if (candidate := (settings or video_settings).models_dir / filename).is_file()
+            else None
+        ),
+    )
     with TestClient(app) as client:
         listed = client.get("/api/models")
         assert listed.status_code == 200

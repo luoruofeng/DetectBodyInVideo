@@ -6,6 +6,8 @@ import { AlertIcon, CheckIcon, DownloadIcon } from './icons'
 
 interface ModelCardProps {
   models: UseModels
+  /** 当前硬件推荐的姿态模型档位（lite/full/heavy） */
+  recommendedTier?: string | null
 }
 
 const TIER_LABELS: Record<string, string> = {
@@ -62,16 +64,18 @@ function TierRow({
 }
 
 /** 首启检查：缺少姿态模型时提供带进度和镜像的下载入口（任务 10.4）。 */
-export function ModelCard({ models }: ModelCardProps) {
+export function ModelCard({ models, recommendedTier }: ModelCardProps) {
   const { payload, active, error, mirror, setMirror, download } = models
 
   if (!payload) return null
 
+  const poseModels = payload.models.filter((item) => item.kind === 'pose')
+  const recommendedEntry = poseModels.find((item) => item.tier === recommendedTier)
+  const recommendedMissing = Boolean(recommendedEntry && !recommendedEntry.present)
   const ready = payload.poseReady
   const downloading = Boolean(active && (active.state === 'running' || active.state === 'queued'))
-  if (ready && !downloading && !error) return null
+  if (ready && !recommendedMissing && !downloading && !error) return null
 
-  const poseModels = payload.models.filter((item) => item.kind === 'pose')
   const ordered = ['lite', 'full', 'heavy']
     .map((tier) => poseModels.find((item) => item.tier === tier))
     .filter((item): item is ModelFileInfo => Boolean(item))
@@ -84,7 +88,7 @@ export function ModelCard({ models }: ModelCardProps) {
       <header className="card-title">
         <span className="flex items-center gap-2 text-warn">
           <AlertIcon className="h-3.5 w-3.5" />
-          首次运行：需要姿态模型
+          {ready ? '推荐档位模型未就绪' : '首次运行：需要姿态模型'}
         </span>
       </header>
 
@@ -92,6 +96,12 @@ export function ModelCard({ models }: ModelCardProps) {
         <p className="text-2xs leading-relaxed text-slate-400">
           识别功能依赖 MediaPipe 姿态模型（每个档位约 5–30 MB）。下载后保存在本机
           <span className="font-mono"> ~/.detect-body/models</span>，不会上传任何数据。
+          {recommendedMissing && recommendedEntry ? (
+            <span className="block text-warn">
+              当前硬件推荐 {TIER_LABELS[recommendedEntry.tier ?? ''] ?? recommendedEntry.tier} 档，
+              但缺少 {recommendedEntry.filename}；未下载时会临时回退到已有档位。
+            </span>
+          ) : null}
         </p>
 
         <div className="space-y-1.5">
@@ -99,7 +109,7 @@ export function ModelCard({ models }: ModelCardProps) {
             <TierRow
               key={entry.filename}
               entry={entry}
-              recommended={entry.tier === 'full'}
+              recommended={entry.filename === recommendedEntry?.filename || entry.tier === 'full'}
               busy={downloading}
               onDownload={() => void download(entry.tier ?? 'full')}
             />

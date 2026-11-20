@@ -53,7 +53,9 @@ class _OkEngine(PoseEngine):
     display_name = "OK Engine"
 
     @classmethod
-    def availability(cls, settings: Settings | None = None) -> tuple[bool, str]:
+    def availability(
+        cls, settings: Settings | None = None, plan: object | None = None
+    ) -> tuple[bool, str]:
         return True, ""
 
     def prepare(self, device: str | None = None) -> None:
@@ -83,7 +85,9 @@ class _MissingEngine(_OkEngine):
     display_name = "Missing Engine"
 
     @classmethod
-    def availability(cls, settings: Settings | None = None) -> tuple[bool, str]:
+    def availability(
+        cls, settings: Settings | None = None, plan: object | None = None
+    ) -> tuple[bool, str]:
         return False, "缺模型"
 
 
@@ -175,14 +179,64 @@ def test_select_engine_uses_onnx_first_on_gpu(monkeypatch, tmp_path) -> None:
     assert selection.degraded is False
 
 
-def test_unavailable_engines_raise_app_error() -> None:
+class _TierAwareEngine(_OkEngine):
+    name = "tieraware"
+    plans: list[object | None] = []
+    note = "heavy 档模型缺失，已回退 full 档（pose_landmarker_full.task）"
+
+    @classmethod
+    def availability(
+        cls, settings: Settings | None = None, plan: object | None = None
+    ) -> tuple[bool, str]:
+        cls.plans.append(plan)
+        return True, cls.note
+
+    def prepare(self, device: str | None = None) -> None:
+        self._prepared = True
+        self._notes.append(self.note)
+
+
+def test_select_engine_passes_plan_and_dedupes_notes(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(registry, "_FACTORIES", {}, raising=True)
+    monkeypatch.setattr(registry, "_ORDER", {}, raising=True)
+    registry.register_engine("tieraware", _factory_for(_TierAwareEngine), priority=10)
+    plan = _Plan()
+    engine, selection = registry.select_engine(
+        plan, settings=_settings(tmp_path), preferred="tieraware"
+    )
+    try:
+        assert _TierAwareEngine.plans[-1] is plan
+        assert [item for item in selection.reasons if _TierAwareEngine.note in item] == [
+            f"tieraware：{_TierAwareEngine.note}"
+        ]
+    finally:
+        engine.close()
+
+
+def test_mediapipe_model_falls_back_to_available_tier(tmp_path) -> None:
+    from app.backend.engine.models import resolve_mediapipe_model
+
+    settings = _settings(tmp_path)
+    settings.models_dir.mkdir(parents=True, exist_ok=True)
+    (settings.models_dir / "pose_landmarker_full.task").write_bytes(b"0")
+
+    resolved = resolve_mediapipe_model(
+        "pose", settings=settings, tier="heavy", allow_download=False
+    )
+    assert resolved.name == "pose_landmarker_full.task"
+
+
+def test_unavailable_engines_raise_app_error(tmp_path) -> None:
     from app.backend.engine.mediapipe_engine import MediaPipePoseEngine
 
-    available, reason = MediaPipePoseEngine.availability()
+    settings = _settings(tmp_path)
+    available, reason = MediaPipePoseEngine.availability(settings)
     assert isinstance(available, bool)
     assert isinstance(reason, str)
     with pytest.raises(AppError):
-        MediaPipePoseEngine().prepare()
+        MediaPipePoseEngine(
+            settings=settings, model_path=str(tmp_path / "missing.task")
+        ).prepare()
 
 
 # --------------------------------------------------------------------------- #

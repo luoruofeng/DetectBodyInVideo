@@ -62,7 +62,7 @@ export function AppHeader({
   onExport,
 }: AppHeaderProps) {
   return (
-    <header className="flex shrink-0 items-center justify-between gap-4 border-b border-line bg-panel/60 px-5 py-3 backdrop-blur">
+    <header className="relative z-30 flex shrink-0 items-center justify-between gap-4 border-b border-line bg-panel/60 px-5 py-3 backdrop-blur">
       <div className="flex min-w-0 items-center gap-3">
         <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent/10 ring-1 ring-inset ring-accent/30">
           <PoseIcon className="h-5 w-5 text-accent" />

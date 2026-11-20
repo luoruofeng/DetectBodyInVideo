@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,9 +25,19 @@ from app.backend.engine.base import (
     PoseFrame,
     engine_tier,
 )
-from app.backend.engine.models import resolve_mediapipe_model
+from app.backend.engine.models import POSE_MODEL_FILENAMES, resolve_mediapipe_model
 
 logger = get_logger("engine.mediapipe")
+
+
+def _fallback_note(tier: str, resolved: Path | str) -> str:
+    """实际加载的模型与请求档位不同时生成一条可展示的说明。"""
+    expected = POSE_MODEL_FILENAMES.get(tier)
+    name = Path(resolved).name
+    if not expected or name == expected:
+        return ""
+    actual = next((key for key, value in POSE_MODEL_FILENAMES.items() if value == name), None)
+    return f"{tier} 档模型缺失，已回退 {actual or name} 档（{name}）"
 
 
 def _import_mediapipe() -> tuple[Any, Any, Any]:
@@ -91,21 +102,24 @@ class MediaPipePoseEngine(PoseEngine):
 
     # ---- 选型 ----
     @classmethod
-    def availability(cls, settings: Settings | None = None) -> tuple[bool, str]:
+    def availability(
+        cls, settings: Settings | None = None, plan: object | None = None
+    ) -> tuple[bool, str]:
         try:
             _import_mediapipe()
         except EngineUnavailableError as exc:
             return False, exc.message
+        tier = engine_tier(settings, plan)
         try:
-            resolve_mediapipe_model(
+            model_file = resolve_mediapipe_model(
                 "pose",
                 settings=settings,
-                tier=engine_tier(settings, None),
+                tier=tier,
                 allow_download=bool(settings and settings.auto_download_models),
             )
         except EngineUnavailableError as exc:
             return False, exc.message
-        return True, ""
+        return True, _fallback_note(tier, model_file)
 
     # ---- 生命周期 ----
     def prepare(self, device: str | None = None) -> None:
@@ -118,6 +132,9 @@ class MediaPipePoseEngine(PoseEngine):
             tier=self.tier,
             explicit=self.model_path,
         )
+        note = _fallback_note(self.tier, model_file)
+        if note:
+            self._notes.append(note)
         self._resolved_model = str(model_file)
         self._mode = "VIDEO" if self.smooth_landmarks else "IMAGE"
         running_mode = mp_vision.RunningMode.VIDEO if self._mode == "VIDEO" else mp_vision.RunningMode.IMAGE

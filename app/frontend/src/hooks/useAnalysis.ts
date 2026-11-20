@@ -41,6 +41,8 @@ export interface UseAnalysis {
   framesLoading: boolean
   framesLoaded: number
   error: string | null
+  /** 后端错误详情（如引擎降级失败原因链） */
+  errorDetails: Record<string, unknown> | null
   exporting: boolean
   artifact: ExportArtifact | null
   /** 导出文件在后端 exports 目录里时的下载地址；另存到别处时为 null */
@@ -80,6 +82,8 @@ export function useAnalysis(): UseAnalysis {
   /** 已合并到 frames 里的帧数，也是下一次增量请求的 offset（推理中数据只追加不修改）。 */
   const framesOffset = useRef(0)
   const framesBusy = useRef(false)
+  /** 新任务尚未成功发起帧请求时保持 true：取消→续跑的竞态下也能补拉已恢复的关键帧。 */
+  const framesRequested = useRef(false)
   /** 请求途中收到"需要整体重载"（例如任务完成切到最终结果）时置位。 */
   const framesReload = useRef(false)
   const syncedFramesDone = useRef(-1)
@@ -104,6 +108,7 @@ export function useAnalysis(): UseAnalysis {
       if (reset) framesReload.current = true
       if (framesBusy.current) return
       framesBusy.current = true
+      framesRequested.current = false
       try {
         // 一次请求期间可能又来了重载请求（预览 → 最终结果），处理完后再补一轮
         for (;;) {
@@ -173,7 +178,7 @@ export function useAnalysis(): UseAnalysis {
         if (
           next.canPreview &&
           (next.phase === 'queued' || next.phase === 'running') &&
-          next.progress.frames_done !== syncedFramesDone.current
+          (framesRequested.current || next.progress.frames_done !== syncedFramesDone.current)
         ) {
           syncedFramesDone.current = next.progress.frames_done
           void loadFrames(id)
@@ -208,6 +213,7 @@ export function useAnalysis(): UseAnalysis {
       framesJob.current = null
       framesOffset.current = 0
       framesReload.current = false
+      framesRequested.current = true
       syncedFramesDone.current = -1
       loadGeneration.current += 1
       lastPhase.current = 'idle'
@@ -320,6 +326,7 @@ export function useAnalysis(): UseAnalysis {
     framesJob.current = null
     framesOffset.current = 0
     framesReload.current = false
+    framesRequested.current = true
     syncedFramesDone.current = -1
     loadGeneration.current += 1
     lastPhase.current = 'idle'
@@ -362,6 +369,7 @@ export function useAnalysis(): UseAnalysis {
     framesLoading,
     framesLoaded,
     error,
+    errorDetails: status?.error_details ?? null,
     exporting,
     artifact,
     downloadUrl,

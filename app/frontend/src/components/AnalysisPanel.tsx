@@ -208,6 +208,13 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
 
   const running = analysis.phase === 'queued' || analysis.phase === 'running'
   const selection = analysis.status?.selection
+  const errorDetails = analysis.errorDetails
+  const errorReasons = Array.isArray(errorDetails?.reasons)
+    ? (errorDetails.reasons as unknown[]).filter(
+        (item): item is string => typeof item === 'string' && item.length > 0,
+      )
+    : []
+  const errorHint = typeof errorDetails?.hint === 'string' ? errorDetails.hint : ''
   // 骨长约束拟合必须要有 world landmarks（米制），引擎不支持时置灰
   const fitAvailable = !selection || selection.capabilities.world_landmarks
   const estimatedFrames = useMemo(() => {
@@ -375,9 +382,21 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
           </div>
 
           {analysis.error ? (
-            <div className="flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-2xs text-danger">
-              <AlertIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="break-all">{analysis.error}</span>
+            <div className="space-y-1.5 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-2xs text-danger">
+              <div className="flex items-start gap-2">
+                <AlertIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span className="break-all">{analysis.error}</span>
+              </div>
+              {errorReasons.length ? (
+                <ul className="ml-5 list-disc space-y-0.5 text-slate-400">
+                  {errorReasons.map((reason) => (
+                    <li key={reason} className="break-all">
+                      {reason}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {errorHint ? <p className="ml-5 break-all text-slate-400">{errorHint}</p> : null}
             </div>
           ) : null}
 

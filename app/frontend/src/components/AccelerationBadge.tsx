@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react'
+
 import { providerLabel, type HardwareReport } from '../api/hardware'
 import { CpuIcon } from './icons'
 
@@ -30,6 +32,32 @@ function Dot({ state }: { state: BadgeState }) {
 }
 
 export function AccelerationBadge({ report, loading, error, onRefresh }: AccelerationBadgeProps) {
+  const detailsRef = useRef<HTMLDetailsElement>(null)
+
+  // 点击面板外部 / 按 Esc 收起，避免浮层一直盖在视频画面上
+  useEffect(() => {
+    const element = detailsRef.current
+    if (!element) return
+    const close = () => {
+      element.open = false
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (!element.open) return
+      if (event.target instanceof Node && element.contains(event.target)) return
+      close()
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!element.open || event.key !== 'Escape') return
+      close()
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [])
+
   const state: BadgeState = error
     ? 'error'
     : loading && !report
@@ -58,7 +86,7 @@ export function AccelerationBadge({ report, loading, error, onRefresh }: Acceler
           : '未启用 GPU 加速，推理走 CPU 多线程'
 
   return (
-    <details className="group relative">
+    <details ref={detailsRef} className="group relative">
       <summary
         className={`chip cursor-pointer list-none transition [&::-webkit-details-marker]:hidden ${TONE[state]}`}
         title={summary}
@@ -71,7 +99,7 @@ export function AccelerationBadge({ report, loading, error, onRefresh }: Acceler
         </svg>
       </summary>
 
-      <div className="absolute right-0 top-[calc(100%+8px)] z-40 w-80 rounded-xl border border-line bg-elevated p-3 text-slate-300 shadow-panel animate-fade-in">
+      <div className="absolute right-0 top-[calc(100%+8px)] z-50 max-h-[calc(100vh-5.5rem)] w-80 max-w-[calc(100vw-1.5rem)] overflow-y-auto rounded-xl border border-line bg-elevated p-3 text-slate-300 shadow-panel animate-fade-in">
         <div className="flex items-start gap-2 border-b border-line pb-2.5">
           <CpuIcon className="mt-0.5 h-4 w-4 text-accent" />
           <div className="min-w-0 flex-1">

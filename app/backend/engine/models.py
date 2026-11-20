@@ -162,6 +162,22 @@ def resolve_mediapipe_model(
     if allow_download and url:
         return download_model(url, candidate)
 
+    # 硬件按显存推荐的档位可能高于用户已下载的档位（例如 heavy 推荐但只有 full）。
+    # 有任意一档姿态模型就先跑起来，并让调用方把回退写进引擎说明。
+    if not explicit and kind == "pose":
+        fallback_order = [
+            POSE_MODEL_FILENAMES[tier_name]
+            for tier_name in ("full", "lite", "heavy")
+            if POSE_MODEL_FILENAMES[tier_name] != filename
+        ]
+        for fallback_name in fallback_order:
+            found = find_model(fallback_name, settings)
+            if found is not None:
+                logger.warning(
+                    "缺少 %s 档姿态模型 %s，回退到 %s", tier, filename, found.name
+                )
+                return found
+
     raise EngineUnavailableError(
         f"缺少 MediaPipe 模型 {filename}",
         details={

@@ -10,6 +10,8 @@
    因此输出的骨长严格恒定，参数维度也更低（每骨段 2 维，无冗余自由度）。
 3. **残差**：
    - 主残差：FK 关节按弱透视投影到归一化图像坐标，与 2D ``landmarks`` 求差，按 visibility 加权；
+   - 遮挡保持：可见度不足 / 单帧方向突变的骨段，保持上一次可信的**相对骨段角度**；
+     目标方向随父关节旋转，因此被挡住的手臂/腿会跟着身体走，不会被低置信误检拉错位；
    - 次残差：相对上一帧的关节位置变化（抑制抖动）；
    - 根平移先验：压住深度方向（z 没有 2D 观测，只能靠先验固定）。
 4. **求解**：``scipy.optimize.least_squares(method="trf", loss=..., max_nfev=...)``。
@@ -135,6 +137,29 @@ class FitConfig(BaseModel):
     max_yaw_deviation: float = Field(25.0, gt=0, le=90, description="允许偏离 2D yaw 的角度（度）")
     loss: Literal["linear", "soft_l1", "huber", "cauchy", "arctan"] = "soft_l1"
     min_visibility: float = Field(0.5, ge=0, lt=1, description="低于该可见度的点不参与残差")
+    hold_occluded_limbs: bool = Field(
+        True,
+        description="肢体被遮挡时保持上一帧的相对骨段角度：低可见度或单帧方向突变的关节"
+        "不再被噪声观测牵着走，而是随父关节的旋转继续运动，避免错位/扭曲",
+    )
+    occlusion_weight: float = Field(
+        1.5,
+        ge=0,
+        le=10,
+        description="遮挡保持残差权重（相对 2D 重投影）；0 等价于只按可见点拟合",
+    )
+    occlusion_max_frames: int = Field(
+        30,
+        ge=1,
+        le=300,
+        description="连续遮挡保持的最大帧数；超过后停止保持，不长期凭空维持旧姿态",
+    )
+    occlusion_jump_degrees: float = Field(
+        75.0,
+        gt=0,
+        le=180,
+        description="单帧骨段方向突变阈值（度）；超过视为误检/瞬时遮挡，按上一姿态保持",
+    )
     max_reproj_error: float = Field(
         0.05,
         gt=0,
@@ -208,6 +233,9 @@ class FrameFitReport(BaseModel):
     rigidified: bool = Field(
         False, description="未做 2D 拟合，但已按标定骨长重建（骨长仍恒定）"
     )
+    held_joints: list[str] = Field(
+        default_factory=list, description="本帧因遮挡/突变而沿用上一姿态的骨段节点名"
+    )
     note: str = ""
 
 
@@ -220,6 +248,9 @@ class FitReport(BaseModel):
     frames_skipped: int = 0
     frames_rigidified: int = Field(
         0, description="未参与 2D 拟合、但已按标定骨长重建的帧数（骨长仍恒定）"
+    )
+    frames_occlusion_held: int = Field(
+        0, description="至少有一个肢体关节被遮挡保持的帧数"
     )
     iterations: int = 0
     cost: float = 0.0
@@ -307,6 +338,10 @@ def _node_positions(points: Sequence[Landmark]) -> dict[str, np.ndarray]:
     return positions
 
 
+def _positions_array(positions: Mapping[str, np.ndarray]) -> np.ndarray:
+    return np.stack([positions[node.key] for node in NODES], axis=0)
+
+
 def _segment_lengths(positions: Mapping[str, np.ndarray]) -> dict[str, float]:
     lengths: dict[str, float] = {}
     for node in BONE_SEGMENTS:
@@ -326,6 +361,111 @@ def _pair_visible(frame: PoseFrame, first: int, second: int, threshold: float) -
     if len(frame.landmarks) <= max(first, second):
         return False
     return min(frame.landmarks[first].visibility, frame.landmarks[second].visibility) >= threshold
+
+
+def _unit(vector: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+    """归一化方向；零向量/非有限值回落到 ``fallback``（默认竖直方向）。"""
+    default = np.array([0.0, 1.0, 0.0], dtype=np.float64) if fallback is None else fallback
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9 or not math.isfinite(norm):
+        return np.asarray(default, dtype=np.float64).copy()
+    return np.asarray(vector, dtype=np.float64) / norm
+
+
+def _rotate_vector(source: np.ndarray, target: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """把 ``vector`` 按 source→target 的最小旋转变换（罗德里格斯公式，不构造矩阵）。"""
+    a, b = _unit(source), _unit(target)
+    axis = np.cross(a, b)
+    sine = float(np.linalg.norm(axis))
+    cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if sine <= 1e-6:
+        return np.asarray(vector, dtype=np.float64).copy()
+    axis /= sine
+    return (
+        vector * cosine
+        + np.cross(axis, vector) * sine
+        + axis * float(np.dot(axis, vector)) * (1.0 - cosine)
+    )
+
+
+def _occlusion_weight(age: int, config: FitConfig) -> float:
+    """保持强度随连续遮挡帧数线性衰减，避免长时间遮挡把旧姿态永久钉死。"""
+    limit = config.occlusion_max_frames
+    if age >= limit:
+        return 0.0
+    fade = max(1, limit // 3)
+    if age <= limit - fade:
+        return 1.0
+    return float(limit - age) / fade
+
+
+def _occlusion_targets(
+    frame: PoseFrame,
+    current: np.ndarray,
+    previous: np.ndarray | None,
+    parent: np.ndarray,
+    last_dirs: np.ndarray | None,
+    last_parent_dirs: np.ndarray | None,
+    hold_age: Sequence[int],
+    config: FitConfig,
+) -> tuple[dict[int, tuple[np.ndarray, float]], list[bool]]:
+    """找出本帧需要保持的骨段，并算出它们在当前父关节坐标下的目标方向。
+
+    保持的是**相对角度**而不是绝对坐标：被挡住的关节跟着父骨段一起旋转，
+    因此躯干转身/抬手时不会凭空断裂；骨段长度仍由 FK 的硬约束保证不变。
+    """
+    count = len(NODES)
+    directions: list[np.ndarray | None] = [None] * count
+    current_dirs: list[np.ndarray | None] = [None] * count
+    occluded = [False] * count
+    cosine_limit = math.cos(math.radians(config.occlusion_jump_degrees))
+
+    for i in range(1, count):
+        node = NODES[i]
+        p = int(parent[i])
+        # 虚节点（chest/pelvis）没有可见度，但它们的方向是子关节的旋转参考，必须算
+        current_dirs[i] = _unit(
+            current[i] - current[p],
+            directions[p] if directions[p] is not None else None,
+        )
+        if node.index is None or node.index >= len(frame.landmarks):
+            continue
+        low_visibility = frame.landmarks[node.index].visibility < config.min_visibility
+        jump = False
+        if not low_visibility and previous is not None and last_dirs is not None and p != 0:
+            # 先用"相对上一帧的原始方向变化"做廉价门控：绝大多数帧方向变化很小，
+            # 不必再算父关节旋转；只有变化确实大时才检查是不是随父关节一起转的。
+            raw_change = float(np.dot(_unit(previous[i] - previous[p]), current_dirs[i]))
+            if raw_change < cosine_limit:
+                grandparent = int(parent[p])
+                prev_dir = _unit(previous[p] - previous[grandparent])
+                if float(np.linalg.norm(prev_dir)) <= 1e-9 and last_parent_dirs is not None:
+                    prev_dir = last_parent_dirs[i]
+                if float(np.linalg.norm(prev_dir)) > 1e-9:
+                    curr_dir = _unit(current[p] - current[grandparent])
+                    expected = _rotate_vector(prev_dir, curr_dir, last_dirs[i])
+                    jump = float(np.dot(_unit(expected), current_dirs[i])) < cosine_limit
+        occluded[i] = low_visibility or jump
+
+    held: dict[int, tuple[np.ndarray, float]] = {}
+    for i in range(1, count):
+        p = int(parent[i])
+        if current_dirs[i] is None:
+            continue
+        if not occluded[i] or previous is None or last_dirs is None or hold_age[i] >= config.occlusion_max_frames:
+            directions[i] = current_dirs[i]
+            continue
+
+        reference = last_parent_dirs[i] if last_parent_dirs is not None else None
+        if p == 0 or directions[p] is None or reference is None or float(np.linalg.norm(reference)) <= 1e-9:
+            target = last_dirs[i]
+        else:
+            target = _rotate_vector(reference, directions[p], last_dirs[i])
+        directions[i] = _unit(target, current_dirs[i])
+        weight = _occlusion_weight(hold_age[i], config) * config.occlusion_weight
+        if weight > 0:
+            held[i] = (directions[i], math.sqrt(weight))
+    return held, occluded
 
 
 def _normalized_positions(frame: PoseFrame, aspect: float) -> dict[str, np.ndarray]:
@@ -614,6 +754,9 @@ class _FrameContext:
         "d0",
         "flat_scale",
         "fk_terms",
+        "held_dir",
+        "held_idx",
+        "held_weight",
         "initial",
         "prior_scale",
         "e1",
@@ -690,6 +833,7 @@ def _make_context(
     aspect: float,
     previous: np.ndarray | None,
     yaw_prior: tuple[float, float] | None,
+    held: Mapping[int, tuple[np.ndarray, float]] | None = None,
 ) -> _FrameContext:
     keys = [node.key for node in NODES]
     index_of = {key: i for i, key in enumerate(keys)}
@@ -755,6 +899,12 @@ def _make_context(
             rotated[:, 2] = -d0[:, 0] * sin_d + d0[:, 2] * cos_d
             d0 = rotated
 
+    # 遮挡保持：直接把初始方向换成"上一姿态随父关节旋转后"的方向，而不是让
+    # 优化器从一个低置信误检的方向往回爬；参数 0 处即满足保持残差。
+    if held:
+        for index, (direction, _) in held.items():
+            d0[index] = _unit(direction)
+
     e1 = np.zeros_like(d0)
     e2 = np.zeros_like(d0)
     for i in range(len(NODES)):
@@ -777,6 +927,18 @@ def _make_context(
     context.d0 = d0
     context.e1 = e1
     context.e2 = e2
+    held_indices = sorted(held or {})
+    context.held_idx = np.asarray(held_indices, dtype=np.int64)
+    context.held_dir = (
+        np.stack([_unit(held[index][0]) for index in held_indices])
+        if held_indices
+        else np.zeros((0, 3), dtype=np.float64)
+    )
+    context.held_weight = (
+        np.asarray([held[index][1] for index in held_indices], dtype=np.float64)
+        if held_indices
+        else np.zeros(0, dtype=np.float64)
+    )
     context.length = length
     # FK 用的纯标量表（见 _forward_kinematics）：每个节点 (父节点, 骨长, d0, e1, e2)
     context.fk_terms = [
@@ -854,6 +1016,13 @@ def _build_sparsity(context: _FrameContext, config: FitConfig) -> np.ndarray:
             rows.append((cursor + offset, cols))  # u
             rows.append((cursor + reproj_count + offset, cols))  # v
         cursor += 2 * reproj_count
+
+    # 遮挡保持：每骨段 3 行，依赖自己和祖先的方向参数
+    for offset, node in enumerate(context.held_idx):
+        cols = columns_for(int(node))
+        for axis in range(3):
+            rows.append((cursor + offset * 3 + axis, cols))
+    cursor += int(context.held_idx.size) * 3
 
     # 深度压平残差：每骨段一行，只依赖自己与祖先的方向参数（与重投影残差同列组）
     if float(np.max(context.flat_scale)) > 0:
@@ -951,6 +1120,15 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
         parts.append((predicted_u - context.obs_u) * weight)
         parts.append((predicted_v - context.obs_v) * weight)
 
+    # 遮挡保持：被挡住的骨段没有可靠 2D观测，用上一姿态的相对角度约束方向。
+    # 这里只罚方向（不含长度）：长度由 FK 硬约束固定，父关节移动时子关节自然跟随。
+    if context.held_idx.size:
+        vectors = positions[context.held_idx] - positions[context.parent[context.held_idx]]
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        directions = vectors / np.maximum(norms, 1e-9)
+        error = (directions - context.held_dir) * context.held_weight[:, None]
+        parts.append(error.ravel())
+
     # 深度压平：把每条骨段沿视线的分量压向 0。权重按"该骨段有多贴合画面平面"门控，
     # 于是正面站直的小腿不会被解成屈膝，而正面伸向镜头的胳膊依然保留真实深度。
     if float(np.max(context.flat_scale)) > 0:
@@ -1031,24 +1209,73 @@ class FrameFitter:
         self.config = config or FitConfig()
         self.lengths = lengths
         self._previous: np.ndarray | None = None
+        keys = [node.key for node in NODES]
+        index_of = {key: i for i, key in enumerate(keys)}
+        self._parent = np.array(
+            [index_of.get(node.parent or "", 0) for node in NODES], dtype=np.int64
+        )
+        self._parent[0] = 0
+        self._last_dirs: np.ndarray | None = None
+        self._last_parent_dirs: np.ndarray | None = None
+        self._hold_age = [0] * len(NODES)
 
-    def _fallback(self, frame: PoseFrame, note: str) -> tuple[PoseFrame, FrameFitReport]:
+    def _update_occlusion_state(self, array: np.ndarray, occluded: Sequence[bool]) -> None:
+        """更新"上次可信方向"与连续遮挡帧数；被保持的关节不覆盖参考姿态。"""
+        if self._last_dirs is None:
+            self._last_dirs = np.zeros_like(array)
+            self._last_parent_dirs = np.zeros_like(array)
+        assert self._last_dirs is not None and self._last_parent_dirs is not None
+        for i in range(1, len(NODES)):
+            p = int(self._parent[i])
+            has_reference = float(np.linalg.norm(self._last_dirs[i])) > 1e-9
+            if occluded[i] and has_reference:
+                self._hold_age[i] += 1
+                continue
+            self._hold_age[i] = 0
+            self._last_dirs[i] = _unit(array[i] - array[p])
+            if p != 0:
+                self._last_parent_dirs[i] = _unit(array[p] - array[int(self._parent[p])])
+            else:
+                self._last_parent_dirs[i] = 0.0
+
+    def _fallback(
+        self,
+        frame: PoseFrame,
+        note: str,
+        *,
+        held: Mapping[int, tuple[np.ndarray, float]] | None = None,
+        occluded: Sequence[bool] | None = None,
+    ) -> tuple[PoseFrame, FrameFitReport]:
         """不做 2D 拟合时的兜底：尽量把骨长归一，而不是原样透传。
 
         原样透传会让这一帧的骨长继续沿用引擎的逐帧猜测，和左右相邻帧的标定骨长
         不一致，播放时表现为"某个肢体的长度突然弹一下"。
         """
         report = FrameFitReport(index=frame.index, note=note)
+        if held:
+            report.held_joints = [NODES[index].key for index in sorted(held)]
+        flags = occluded or [False] * len(NODES)
+
+        def commit(output: PoseFrame) -> PoseFrame:
+            available = _node_positions(output.world_landmarks)
+            if available:
+                self._update_occlusion_state(_positions_array(available), flags)
+            return output
+
         if not self.config.rigidify_failed_frames:
-            return frame.model_copy(deep=True), report
+            return commit(frame.model_copy(deep=True)), report
         rigid = _rigidify(
-            frame, self.lengths, self.config, self.config.aspect_ratio or DEFAULT_ASPECT
+            frame,
+            self.lengths,
+            self.config,
+            self.config.aspect_ratio or DEFAULT_ASPECT,
+            held=held,
         )
         if rigid is None:
-            return frame.model_copy(deep=True), report
+            return commit(frame.model_copy(deep=True)), report
         report.rigidified = True
         report.note = f"{note}；已按标定骨长重建（骨长保持恒定）"
-        return rigid, report
+        return commit(rigid), report
 
     def fit(
         self, frame: PoseFrame, *, yaw: tuple[float, float] | None = None
@@ -1074,11 +1301,29 @@ class FrameFitter:
             report.note = "跳过（世界坐标不完整）"
             return frame.model_copy(deep=True), report
 
+        current_array = _positions_array(positions)
+        held: dict[int, tuple[np.ndarray, float]] = {}
+        occluded = [False] * len(NODES)
+        if config.hold_occluded_limbs:
+            held, occluded = _occlusion_targets(
+                frame,
+                current_array,
+                self._previous,
+                self._parent,
+                self._last_dirs,
+                self._last_parent_dirs,
+                self._hold_age,
+                config,
+            )
+        report.held_joints = [NODES[index].key for index in sorted(held)]
+
         context = _make_context(
-            frame, positions, self.lengths, config, aspect, self._previous, yaw
+            frame, positions, self.lengths, config, aspect, self._previous, yaw, held=held
         )
         if context.scale <= 1e-9:
-            return self._fallback(frame, "跳过（弱透视尺度估计失败）")
+            return self._fallback(
+                frame, "跳过（弱透视尺度估计失败）", held=held, occluded=occluded
+            )
 
         initial = np.zeros(ROOT_PARAMS + 2 * (len(NODES) - 1), dtype=np.float64)
         if _least_squares is None:  # pragma: no cover - 依赖缺失时降级
@@ -1092,6 +1337,7 @@ class FrameFitter:
             report.bone_length_error_pct = round(bone, 4)
             report.note = "未安装 scipy，仅做骨长钳制（不做最小二乘拟合）"
             self._previous = fitted
+            self._update_occlusion_state(fitted, occluded)
             return _write_back(frame, fitted), report
         try:
             solution = _least_squares(
@@ -1108,7 +1354,7 @@ class FrameFitter:
             )
         except Exception as exc:  # pragma: no cover - 数值异常兜底
             logger.debug("第 %s 帧拟合失败：%s", frame.index, exc)
-            return self._fallback(frame, f"求解失败：{exc}")
+            return self._fallback(frame, f"求解失败：{exc}", held=held, occluded=occluded)
 
         fitted = _forward_kinematics(solution.x, context)
         reproj, bone = _residual_metrics(fitted, context)
@@ -1133,10 +1379,13 @@ class FrameFitter:
                 frame,
                 f"2D 一致性不达标（{reproj:.4f} > {config.max_reproj_error:.4f}，"
                 f"初始 {initial_reproj:.4f}）",
+                held=held,
+                occluded=occluded,
             )
 
         report.fitted = True
         self._previous = fitted
+        self._update_occlusion_state(fitted, occluded)
         return _write_back(frame, fitted), report
 
 
@@ -1170,6 +1419,8 @@ def _rigidify(
     lengths: BoneLengths,
     config: FitConfig,
     aspect: float,
+    *,
+    held: Mapping[int, tuple[np.ndarray, float]] | None = None,
 ) -> PoseFrame | None:
     """不做最小二乘，只把"观测方向 + 标定骨长"重新走一遍 FK。
 
@@ -1182,11 +1433,11 @@ def _rigidify(
     positions = _node_positions(frame.world_landmarks)
     if not positions:
         return None
-    context = _make_context(frame, positions, lengths, config, aspect, None, None)
+    context = _make_context(frame, positions, lengths, config, aspect, None, None, held=held)
     worst = 0.0
     for i, node in enumerate(NODES):
-        if node.parent is None:
-            continue
+        if node.parent is None or (held and i in held):
+            continue  # 被保持的骨段本来就不用本帧观测方向，不参与"输入是否已崩"判定
         target = float(context.length[i])
         child = positions.get(node.key)
         parent = positions.get(node.parent)
@@ -1285,6 +1536,12 @@ def fit_frames(
         notes.append(f"已使用 {len(yaws)} 帧的 2D yaw 作为拟合先验")
     skipped = len(per_frame) - len(fitted_reports)
     rigidified = sum(1 for item in per_frame if item.rigidified)
+    held_frames = sum(1 for item in per_frame if item.held_joints)
+    if config.hold_occluded_limbs and held_frames:
+        notes.append(
+            f"{held_frames} 帧有肢体被遮挡/突变，已按上一姿态的相对骨段角度保持"
+            f"（上限 {config.occlusion_max_frames} 帧）"
+        )
     if skipped:
         tail = (
             f"其中 {rigidified} 帧已按标定骨长重建（骨长保持恒定）"
@@ -1303,6 +1560,7 @@ def fit_frames(
         frames_fitted=len(fitted_reports),
         frames_skipped=skipped,
         frames_rigidified=rigidified,
+        frames_occlusion_held=held_frames,
         iterations=sum(item.iterations for item in fitted_reports),
         cost=round(float(np.mean([item.cost for item in fitted_reports])), 6)
         if fitted_reports

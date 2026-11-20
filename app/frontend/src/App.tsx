@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type { AnalysisOptions } from './api/analysis'
 import { AppHeader } from './components/AppHeader'
+import { PanelResizeHandle } from './components/PanelResizeHandle'
 import { PlaybackControls } from './components/PlaybackControls'
 import { ShootingGuideDialog } from './components/ShootingGuide'
 import { SidePanel } from './components/SidePanel'
@@ -15,6 +16,7 @@ import { useApiHealth } from './hooks/useApiHealth'
 import { useHardware } from './hooks/useHardware'
 import { useModels } from './hooks/useModels'
 import { usePlayback } from './hooks/usePlayback'
+import { useResizablePanel } from './hooks/useResizablePanel'
 import { useTheme } from './hooks/useTheme'
 import { useVideoUpload } from './hooks/useVideoUpload'
 import { findFrameIndex } from './lib/pose'
@@ -28,6 +30,7 @@ export default function App() {
   const analysis = useAnalysis()
   const models = useModels()
   const { theme, toggle: toggleTheme } = useTheme()
+  const panel = useResizablePanel()
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const openPickerRef = useRef<() => void>(() => {})
@@ -158,8 +161,8 @@ export default function App() {
             onExport={exportJson}
           />
 
-          <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 sm:p-4 lg:flex-row lg:overflow-hidden">
-            <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3">
+          <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 sm:p-4 lg:flex-row lg:gap-0 lg:overflow-hidden">
+            <div className="flex min-w-0 flex-col gap-3 lg:min-h-0 lg:flex-1">
               <VideoStage
                 video={video}
                 previewUrl={upload.state.previewUrl}
@@ -214,7 +217,22 @@ export default function App() {
               </div>
             </div>
 
+            <PanelResizeHandle
+              width={panel.width}
+              minWidth={panel.minWidth}
+              maxWidth={panel.maxWidth}
+              resizing={panel.resizing}
+              onPointerDown={panel.onPointerDown}
+              onPointerMove={panel.onPointerMove}
+              onPointerUp={panel.onPointerUp}
+              onPointerCancel={panel.onPointerCancel}
+              onKeyDown={panel.onKeyDown}
+              onReset={panel.reset}
+            />
+
             <SidePanel
+              width={panel.width}
+              resizing={panel.resizing}
               health={info}
               apiStatus={status}
               hardware={hardware.report}

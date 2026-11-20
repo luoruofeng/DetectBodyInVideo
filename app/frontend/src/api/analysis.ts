@@ -116,6 +116,7 @@ export interface JobStatus {
   summary: AnalysisSummary | null
   error: string | null
   error_code: string | null
+  error_details: Record<string, unknown> | null
   cancel_requested: boolean
   elapsedSeconds: number
   canCancel: boolean

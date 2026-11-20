@@ -51,6 +51,7 @@ class JobStatus(BaseModel):
     summary: dict[str, object] | None = None
     error: str | None = None
     error_code: str | None = None
+    error_details: dict[str, object] | None = None
     cancel_requested: bool = False
     elapsedSeconds: float = 0.0
     canCancel: bool = False
@@ -96,6 +97,7 @@ class AnalysisJob:
         self._live_preview: tuple[LiveFrameJoints, ...] = ()
         self._error: str | None = None
         self._error_code: str | None = None
+        self._error_details: dict[str, object] | None = None
         self._cancel = threading.Event()
         self._started = time.perf_counter()
         self._finished_at: float | None = None
@@ -207,12 +209,14 @@ class AnalysisJob:
                 self._phase = "cancelled"
                 self._error = exc.message
                 self._error_code = exc.code
+                self._error_details = exc.details or None
             logger.info("任务 %s 已取消", self.id)
         except AppError as exc:
             with self._lock:
                 self._phase = "error"
                 self._error = exc.message
                 self._error_code = exc.code
+                self._error_details = exc.details or None
             logger.warning("任务 %s 失败：%s", self.id, exc.message)
         except Exception as exc:  # noqa: BLE001 - 后台线程必须兜住
             with self._lock:
@@ -224,8 +228,11 @@ class AnalysisJob:
             if engine is not None:
                 engine.close()
             with self._lock:
-                self._live_frames = []  # 结束后不再需要边算边看的快照
-                self._live_preview = ()
+                if self._result is not None:
+                    # 成功任务已经有最终结果，边算边看的快照可以释放
+                    self._live_frames = []
+                    self._live_preview = ()
+                # 取消/失败时保留已算出的帧，用户仍能回放检查之前的关键点
                 self._finished_at = time.perf_counter()
 
     # ---- 查询 ----
@@ -243,6 +250,7 @@ class AnalysisJob:
                 summary=summary,
                 error=self._error,
                 error_code=self._error_code,
+                error_details=self._error_details,
                 cancel_requested=self._cancel.is_set(),
                 elapsedSeconds=round(elapsed, 3),
                 canCancel=not self.finished,

@@ -29,6 +29,7 @@ DetectBodyInVideo 是一个**本地运行**的跨平台视频人体姿态分析�
 - [项目结构](#项目结构)
 - [端到端处理流程](#端到端处理流程)
 - [推理引擎、硬件加速与模型](#推理引擎硬件加速与模型)
+  - [应用内 GPU 运行时安装](#应用内-gpu-运行时安装)
 - [界面使用说明](#界面使用说明)
 - [配置参考](#配置参考)
 - [HTTP API](#http-api)
@@ -55,7 +56,7 @@ DetectBodyInVideo 是一个**本地运行**的跨平台视频人体姿态分析�
 在项目根目录执行：
 
 ```powershell
-# 首次准备：创建 .venv、安装 Python dev 依赖、安装 npm 依赖、下载三档 MediaPipe 姿态模型
+# 首次准备：创建 .venv、安装 Python dev 依赖、安装 npm 依赖、下载姿态与手/脸模型
 ./scripts/bootstrap.ps1
 
 # 并行启动后端（:8000，热重载）和前端（:5173，热更新）
@@ -132,7 +133,7 @@ cd app/frontend && npm run dev
 
 安装 `python -m pip install -e .` 后还会获得 `detect-body` 命令，它是桌面壳入口，参数见[三种运行方式](#三种运行方式)。
 
-模型可以在启动后由界面下载，也可以由 bootstrap 预先放到仓库根目录 `models/`。本工作区当前已有 `pose_landmarker_lite.task` 和 `pose_landmarker_full.task`；所有 `*.task` 都被 `.gitignore` 排除，新克隆后需要重新下载，`heavy` 档也需要自行获取。
+模型可以在启动后由界面下载，也可以由 bootstrap 预先放到仓库根目录 `models/`。本工作区当前已有 `pose_landmarker_lite.task`、`pose_landmarker_full.task`（`heavy` 仍缺失）以及手/脸增强所需的 `hand_landmarker.task`、`face_landmarker.task`；所有 `*.task` 都被 `.gitignore` 排除，新克隆后需要重新下载。
 
 ### 1.4 只想用成品，不开发前端
 
@@ -187,7 +188,7 @@ python3 -m uvicorn app.backend.main:app --host 127.0.0.1 --port 8000
 
 ### 2.1 先确认模型状态
 
-首次打开时如果任一姿态模型未就绪，右侧会显示黄色的「首次运行：需要姿态模型」卡片，列出三档模型：
+首次打开且模型清单已返回后，如果任一姿态模型未就绪（或硬件推荐的档位缺失），右侧会显示黄色的「首次运行：需要姿态模型」卡片（推荐档位缺失时标题为「推荐档位模型未就绪」），列出三档模型：
 
 | 档位 | 文件名 | 用途 |
 | --- | --- | --- |
@@ -195,7 +196,7 @@ python3 -m uvicorn app.backend.main:app --host 127.0.0.1 --port 8000
 | 完整 | `pose_landmarker_full.task` | 推荐，精度与速度折中 |
 | 高精度 | `pose_landmarker_heavy.task` | 精度优先，速度较慢 |
 
-点击对应「下载」即可。下载进度每 600 ms 轮询一次；模型写入 `~/.detect-body/models`（源码运行时也可在仓库 `models/`）。**模型卡是条件显示的**：三档中至少有一档存在、且没有下载任务/错误时卡片会自动消失；看不到它不代表没有模型。模型缺失也不会禁用上传和识别按钮，但分析时会因引擎不可用而失败或自动降级。
+点击对应「下载」即可。下载进度每 600 ms 轮询一次；模型写入 `~/.detect-body/models`（源码运行时也可在仓库 `models/`）。**模型卡是条件显示的**：清单未返回时完全不显示；姿态模型全部就绪且推荐档位也存在、且没有下载任务/错误时卡片才消失。看不到它通常代表模型已就绪。模型缺失也不会禁用上传和识别按钮，但分析时会因引擎不可用而失败或自动降级。
 
 网络受限时，在启动服务前设置镜像前缀，或服务启动后在卡片中勾选「使用镜像下载」（只有服务端配置了 `DETECT_BODY_MODEL_MIRROR_URL` 才真正生效）：
 
@@ -209,7 +210,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 
 ### 2.2 拍摄建议弹窗
 
-首次打开会弹出「拍摄建议」遮罩，点「知道了」或按 `Esc` 关闭；关闭状态写入浏览器 `localStorage`，之后不再自动弹出。右侧「拍摄建议」卡片始终存在，默认折叠，可随时展开。
+首次打开会弹出「开拍前先看一眼：怎么拍，深度才可信」遮罩（即「拍摄建议」弹窗），点「知道了」或按 `Esc` 关闭；关闭状态写入浏览器 `localStorage`，之后不再自动弹出。右侧「拍摄建议」卡片始终存在，默认折叠，可随时展开。
 
 ### 2.3 导入视频
 
@@ -220,7 +221,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 - 上传进度 <0.95 显示「正在上传视频…」，之后显示「正在解析元信息…」。
 - 后端按完整文件 SHA-256 去重；同一内容重复上传会复用已有条目，不会重新探测。
 - 编码白名单包含 `h264/hevc/h265/avc1/mp4v/mjpeg/mpeg4/prores`，明确拒绝 `av1/vp9/theora`；未知编码最终以 OpenCV 能否解码首帧为准。
-- 导入成功后舞台显示视频、文件名、分辨率、帧率、体积；右侧出现「识别设置」「数据质检」「导出」「3D 预览」卡片，原「视频信息」卡片由「使用流程」替换。
+- 导入成功后舞台显示视频、文件名、分辨率、帧率、体积；右侧出现「识别设置」「数据质检」「导出」「3D 预览」「Mesh 白膜预览」卡片；未导入时的「运行环境」+「使用流程」被「视频信息」替换。
 
 ### 2.4 设置识别参数
 
@@ -236,7 +237,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 | 断点续算 | 开启 | 同时设置 `checkpoint=true` 与 `resume=true` |
 | 骨长约束拟合 | 开启 | 仅在所选引擎能输出米制 world landmarks 时生效；ONNX 引擎会置灰并关闭 |
 
-面板会显示「预计 N 帧」。所有参数在任务运行期间禁用。
+面板会显示「预计 N 帧」。所有参数在任务运行期间禁用。手/脸增强固定开启（界面无开关）；面板底部还有「清空缓存」按钮，删除断点文件让下次识别从第 1 帧重新开始。
 
 3D 骨骼只使用世界坐标（MediaPipe `world_landmarks`，本身已是米制）：不再提供「归一化 + 身高标定」模式，也不再需要输入身高。导出 JSON 里的 `personHeightMeters` 改为由世界坐标自动测量，只作缩放核对用。
 
@@ -247,27 +248,27 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 进度有两种口径：
 
 - 推理阶段：`frames_done/frames_total 帧`，并显示处理 fps 与 ETA。
-- 后处理阶段：改用真实的 `stage_done/stage_total`，显示 `track → densify → gaps → smooth → yaw → ik_fit → angles → quality` 等阶段，避免推理帧数提前满格显示假 100%。
+- 后处理阶段：改用真实的 `stage_done/stage_total`，显示 `track → densify → gaps → smooth → hands → yaw → ik_fit → angles → quality` 等阶段（`hands` 是手部 21 点时序稳定），避免推理帧数提前满格显示假 100%。
 
-推理一旦结束，`canPreview` 变为 true，即使 IK 后处理还在跑，Canvas 骨架叠加也会先显示原始推理结果，并标记「预览已可用」。任务完成后自动切换为平滑/拟合/质检后的最终结果。点击「取消任务」会设置取消事件；推理与后处理都会检查该事件，任务进入 `cancelled`，断点文件会保留以便续算。
+推理开始后只要已有部分帧落盘，`canPreview` 即为 true（支持边算边看），即使 IK 后处理还在跑，Canvas 骨架叠加也会先显示原始推理结果，并标记「预览已可用」。任务完成后自动切换为平滑/拟合/质检后的最终结果。点击「取消任务」会设置取消事件；推理与后处理都会检查该事件，任务进入 `cancelled`，断点文件会保留以便续算。
 
 ### 2.6 查看质检结论
 
 「数据质检」卡片显示：可交付 / 需复核 / 建议重录，有效帧比例、平均置信度、平均可见度、最大跳变、深度置信度、深度抖动、骨长波动、重投影误差、问题列表和运行说明。
 
-深度置信度判读：≥0.75 可信，0.5–0.75 一般，<0.5 不可信；低于 0.6 时导出结论最多只到 `review`。构图和机位问题只会追加 issues，不会自动降低 verdict。
+深度置信度判读：≥0.75 可信，0.5–0.75 一般，<0.5 不可信；有世界坐标且 `quality.enable_depth_gate=true` 时，低于 0.6 会把导出结论压到最多 `review`。构图和机位问题始终只追加 issues、不会降低 verdict；`enable_framing_rules=false` 时连 issues 都不追加。
 
 ### 2.7 导出与下载
 
-完成后右侧「导出」卡片可用：
+完成后右侧「导出」卡片可用，顶部状态栏也有一个等效的导出按钮（条件相同）：
 
 1. 选择格式：`姿态 JSON`（默认）或 `动作 JSON`。
-2. 姿态 JSON 再选粒度：`compact` 精简 / `keypoints` 仅关键点 / `full` 完整（默认，推荐）。选 `full` 时前端自动附带原始 33 点。
+2. 姿态 JSON 再选粒度：`compact` 精简 / `keypoints` 仅关键点 / `full` 完整（默认，推荐）。选 `full` 时前端自动附带原始 33 点。注意界面文案把 `compact` 写成「关键帧 + 角度」、`keypoints` 写成「只有关键点与角度」，但实际**只有 `full` 会导出角度**，详见「导出格式」。
 3. 点击「导出 JSON」或「导出动作 JSON」会先弹出系统「另存为」对话框：文件名已按命名规则预填，目录默认打开系统桌面，可自行改名或换位置。取消对话框即放弃导出，不写任何文件。
 4. 桌面壳（pywebview）负责这个原生对话框；降级到系统浏览器时没有该能力，会退回到服务端默认目录 `~/.detect-body/exports/`，产物块里出现「下载 JSON」按钮（文件落在默认目录时才会有该按钮）。卡片里的 `artifact.path` 永远是文件的真实落盘路径。
 5. 若 `warnings` 非空，导出成功提示和产物块会同时显示深度可信度提示，并写入 JSON 文件。
 
-快捷键：`空格` 播放/暂停，`←/→` 逐帧（`Shift` 十帧），`Home/End` 首尾，`U` 打开文件选择，`E` 导出，`T` 主题，`S` 骨架开关。焦点在输入框/按钮/链接内时全局快捷键不触发；时间轴自身聚焦后 `←/→` 是 ±1 秒。
+快捷键：`空格` 播放/暂停，`←/→` 逐帧（`Shift` 十帧），`Home/End` 首尾，`U` 打开文件选择，`E` 导出，`T` 主题，`S` 骨架开关。焦点在输入框/按钮/链接内时全局快捷键不触发；时间轴自身聚焦后 `←/→` 是 ±1 秒、`Shift+←/→` 是 ±5 秒，但事件仍会冒泡到全局处理器叠加一次逐帧步进（时间轴底部提示写的「逐帧」属文案笔误）。
 
 ---
 
@@ -336,10 +337,10 @@ npm run typecheck  # 仅 TypeScript 类型检查
 
 | 脚本 | 参数 | 行为 |
 | --- | --- | --- |
-| `scripts/bootstrap.ps1` | `-Cuda`、`-SkipFrontend`、`-SkipModels`、`-Python` | 建 `.venv`、升级 pip、装 `.[dev]` 或 `.[dev,cuda]`、`npm install`、下载 lite/full/heavy 三档模型 |
+| `scripts/bootstrap.ps1` | `-Cuda`、`-SkipFrontend`、`-SkipModels`、`-Python` | 建 `.venv`、升级 pip、装 `.[dev]` 或 `.[dev,cuda]`、`npm install`、下载 lite/full/heavy 三档姿态模型及 hand/face 增强模型 |
 | `scripts/bootstrap.sh` | `--cuda`、`--skip-frontend`、`--skip-models` | 同上，解释器固定 `python3`，模型用 `curl -fL --retry 2` 下载 |
 
-下载失败时脚本只警告、不中断；可稍后在界面、`POST /api/models/download` 或手动放置文件解决。下载先写 `.part` 再原子替换，避免半截文件被当成模型。
+下载失败时脚本只警告、不中断（bash 版会删除残缺文件）；可稍后在界面、`POST /api/models/download` 或手动放置文件解决。bootstrap 直接写目标文件；界面 / API 的下载管理器才写 `.part` 后原子替换，避免半截文件被当成模型。
 
 ### 3.5 模型文件与下载
 
@@ -357,7 +358,7 @@ https://storage.googleapis.com/mediapipe-models
 - 镜像只替换官方 URL 的 host 前缀，路径保持不变。
 - ONNX 权重不自动下载：候选名包括 `rtmpose-s_256x192.onnx`、`rtmpose-m_256x192.onnx`、`rtmpose-l_384x288.onnx`、`rtmo-s_640x640.onnx`、`rtmo-m_640x640.onnx` 等，按档位在模型目录查找；也可用 `DETECT_BODY_ONNX_POSE_MODEL` 指向绝对路径。
 
-手部 21 点/手 + 面部语义点（下颌、下巴、鼻、眼睑、虹膜、嘴角、耳）增强**默认开启**（`AnalysisOptions.refinement`）。逐帧检测后挂到该帧第一个人，用于补全 AppleModel 全关节；缺 `hand_landmarker.task` / `face_landmarker.task` 或缺依赖时自动降级为纯姿态，主链路不受影响。旧版 mediapipe 不支持 `refine_landmarks` 时虹膜点回退为眼中心。
+手部 21 点/手 + 面部 20 个语义点（下颌、下巴、鼻、眼睑、虹膜、嘴角、耳）增强**默认开启**（`AnalysisOptions.refinement`）。逐帧检测后，手按腕点距离匹配到最近的人（超过 0.12 归一化距离则丢弃），脸固定挂到当前帧第一个人，用于补全 AppleModel 全关节；缺 `hand_landmarker.task` / `face_landmarker.task` 或缺依赖时自动降级为纯姿态，主链路不受影响。旧版 mediapipe 不支持 `refine_landmarks` 时虹膜点回退为眼中心。
 
 ### 3.6 运行时数据目录
 
@@ -372,11 +373,12 @@ https://storage.googleapis.com/mediapipe-models
 ├─ exports/       # 默认导出目录
 ├─ checkpoints/   # *.pose.jsonl 断点续算文件
 ├─ logs/          # app.log，轮转 5 MiB × 3
+├─ runtime/       # 应用内安装的 CUDA / DirectML 独立后端（按需创建）
 ├─ webview/       # pywebview 本地存储
 └─ models/        # 打包后默认模型目录
 ```
 
-`DETECT_BODY_DATA_DIR` 可整体迁移；`exports_dir`、`checkpoints_dir`、`logs_dir` 等由 `Settings` 自动派生并在首次启动时创建。
+`DETECT_BODY_DATA_DIR` 可整体迁移；`exports_dir`、`checkpoints_dir`、`logs_dir` 等由 `Settings` 自动派生并在首次启动时创建；`runtime/` 是例外，由应用内安装 GPU 运行时时按需创建。
 
 ---
 
@@ -430,7 +432,7 @@ python3 -m app.desktop.main
 `python -m app.desktop.main` 的行为：
 
 1. 解析 `--port` / `--browser` / `--no-window`。
-2. 优先使用 `--port`，否则读 `DETECT_BODY_PORT`（默认 8000）；被占用则让系统分配空闲端口。
+2. 优先使用 `--port`，否则读 `DETECT_BODY_PORT`（默认 8000）；**只有未显式传 `--port` 时**，配置端口被占用才会让系统分配空闲端口。显式指定且端口被占用会导致绑定失败、健康检查超时并退出码 1。
 3. 后台线程启动 uvicorn，固定 `loop=asyncio`、`http=h11`、`ws=none`，`log_config=None`，避免打包后动态导入问题。
 4. 轮询 `GET /api/health`，最多等 30 秒；超时则退出码 1 并写日志。
 5. 成功后打开 pywebview 窗口；pywebview 不可用或 WebView 运行时缺失则弹原生提示并降级为系统浏览器。
@@ -484,6 +486,7 @@ DetectBodyInVideo/
 │  │  │  ├─ hardware.py          # 硬件报告（60 秒缓存）
 │  │  │  ├─ health.py            # /api/health
 │  │  │  ├─ models.py            # 模型清单与下载
+│  │  │  ├─ runtime.py           # GPU 加速运行时安装 / 切换 / 重启
 │  │  │  └─ videos.py            # 视频列表、上传、缩略图、采样计划
 │  │  ├─ core/
 │  │  │  ├─ settings.py          # Settings、路径派生、.env、DETECT_BODY_ 环境变量
@@ -500,7 +503,8 @@ DetectBodyInVideo/
 │  │  │  ├─ consistency.py       # 帧间/引擎间一致性比较
 │  │  │  ├─ enhancements.py      # 手部 / 面部增强
 │  │  │  ├─ models.py            # 模型 URL、发现、镜像、下载
-│  │  │  └─ model_downloads.py   # 模型下载管理器与进度
+│  │  │  ├─ model_downloads.py   # 模型下载管理器与进度
+│  │  │  └─ accelerator_install.py # 应用内安装 CUDA / DirectML 独立运行时
 │  │  ├─ media/
 │  │  │  ├─ validation.py        # 扩展名 / 编码 / 文件有效性校验
 │  │  │  ├─ probe.py             # 视频探测与缩略图
@@ -519,6 +523,7 @@ DetectBodyInVideo/
 │  │  │  ├─ gaps.py              # 补帧与 densify
 │  │  │  ├─ angles.py            # 关节角度
 │  │  │  ├─ ik_fit.py            # 固定骨长 + 2D 重投影拟合
+│  │  │  ├─ hands.py             # 手部 21 点时序稳定（补帧 / 迟滞 / 平滑）
 │  │  │  └─ quality.py           # 质量报告与 depthConfidence
 │  │  ├─ skeleton/
 │  │  │  ├─ mapping.py           # MediaPipe 33 点 → ARKit 关节
@@ -542,24 +547,25 @@ DetectBodyInVideo/
 │     ├─ src/main.tsx            # React 挂载入口
 │     ├─ src/App.tsx             # 页面组合与全局快捷键
 │     ├─ src/api/                # HTTP 客户端与类型
-│     ├─ src/hooks/              # 上传、任务轮询、播放、硬件、模型、主题
-│     ├─ src/components/         # 上传区、视频舞台、时间轴、面板、3D 预览等
+│     ├─ src/hooks/              # 上传、任务轮询、播放、硬件、模型、主题、GPU 安装
+│     ├─ src/components/         # 上传区、视频舞台、时间轴、面板、3D/Mesh 预览等
 │     ├─ src/lib/                # 格式化与姿态辅助
 │     ├─ src/store/              # 全局状态 AppProvider
 │     └─ vite.config.ts          # 开发代理 /api → :8000；构建到 backend/static
 ├─ docs/                         # 打包、基准、JSON Schema、动作 JSON、深度精度说明
-├─ models/                       # 本地模型权重；*.task 被 gitignore，本工作区当前有 lite/full，新克隆需重新下载
+├─ models/                       # 本地模型权重；*.task 被 gitignore，本工作区有 lite/full + hand/face，heavy 需下载
 ├─ packaging/
 │  └─ detect-body.spec           # PyInstaller onedir 配置
 ├─ samples/
 │  ├─ expected_pose.json         # golden 导出样例
 │  ├─ RealityKitSample.swift     # iOS / macOS 消费示例
 │  └─ benchmark/                 # 深度基准素材清单
+├─ resources/                    # 本地参考模型/样例（gitignore；本工作区已有 AppleModel.usda 等）
 ├─ scripts/                      # bootstrap / dev / build / package / bench / icon
 ├─ start.bat                     # Windows 双击启动入口（源码模式）
 ├─ start.command                 # macOS 双击启动入口（源码模式）
 ├─ start.sh                      # Linux 双击启动入口（源码模式）
-├─ tests/                        # 17 个测试模块 + conftest + 合成姿态工具
+├─ tests/                        # 23 个测试模块 + conftest + 合成姿态工具
 ├─ pyproject.toml                # Python 依赖、CLI、pytest 与 ruff 配置
 └─ TODO.md                       # 历史任务清单，进度百分比可能滞后于代码
 ```
@@ -570,7 +576,7 @@ DetectBodyInVideo/
 - `app/backend/static/`：Vite 构建产物。
 - `app/backend/export/schema.json`：由 `python -m app.backend.export.schema` 生成。
 - `samples/expected_pose.json`：由 `python -m app.backend.export.samples` 生成。
-- `models/*.task`、`samples/*.mp4|mov|m4v`、`resources/`：本地大文件 / 权重，按 `.gitignore` 排除。
+- `models/*.task`、`samples/*.mp4|mov|m4v`、`resources/`：本地大文件 / 权重，按 `.gitignore` 排除；本工作区的 `resources/` 已有 `AppleModel.usda`、`demo.mp4`、`air-squat-motion.json`，新克隆需自行放置。
 - `dist/`、`build/`、`__pycache__/`、`*.pyc`：生成物。
 
 ---
@@ -588,9 +594,11 @@ SamplingConfig → AnalysisPlan：stride、目标 fps、时间范围、帧数
     ↓
 硬件报告 → 加速计划 → select_engine()：MediaPipe 或 ONNX，必要时降级
     ↓
+可选手/脸增强：准备 HandLandmarker / FaceLandmarker，逐帧 refine
+    ↓
 run_inference()：解码线程 → 有界队列 → 推理线程 → PoseFrame[]
     ↓
-run_postprocess()：轨迹筛选 → densify → 补帧 → 平滑 → yaw → IK → 角度/质检
+run_postprocess()：轨迹筛选 → densify → 补帧 → 平滑 → 手部稳定 → yaw → IK → 角度/质检
     ↓
 build_skeleton_bundle()：33 点映射 ARKit、坐标转换、root motion
     ↓
@@ -605,14 +613,14 @@ AnalysisResult → 预览帧 / 姿态 JSON / 动作 JSON
 2. **视频探测**  
    `media/probe.py` 读取容器与流信息，生成缩略图。`SamplingConfig` 结合目标 FPS、开始/结束时间和 stride 生成 `AnalysisPlan`，界面可先用 `POST /api/videos/{id}/plan` 预览会分析多少帧。
 
-3. **引擎选择**  
-   `engine/acceleration.py` 采集 CPU / GPU / 内存 / ONNX EP；`registry.py` 根据 `pose_engine` / `prefer_model_tier` / 运行时计划选择引擎。不可用时记录原因并回退，不会直接中断。
+3. **引擎选择与增强准备**  
+   `engine/acceleration.py` 采集 CPU / GPU / 内存 / ONNX EP；`registry.py` 根据 `pose_engine` / `prefer_model_tier` / 运行时计划选择引擎。不可用时记录原因并回退，不会直接中断。`refinement.hands/face` 默认开启，会再准备 `MediaPipeRefiner` 逐帧补手/脸点；缺模型或依赖时静默降级为纯姿态。
 
 4. **推理运行时**  
    `perf/runner.py` 用一个生产者线程解帧并写入有界队列（`runtime_queue_size`），消费者调用 `engine.infer_batch()`。不支持 batching 的引擎自动退化为 1。`runtime_segment_frames > 0` 时按段推进进度。开启续算后，每帧结果写入 `~/.detect-body/checkpoints/*.pose.jsonl`，中断后重跑会跳过已完成帧。取消任务会停止线程并调用 `engine.close()` 释放资源。
 
 5. **后处理**  
-   `postprocess/pipeline.py` 的实际顺序：track 筛选 → `densify` → 缺失帧补齐 → 平滑 / 世界点单独平滑 → yaw → IK 拟合 → 角度与质检。`legacy_postprocess_config()` 可恢复改造前行为，便于 A/B。
+   `postprocess/pipeline.py` 的实际顺序：track 筛选 → `densify` → 缺失帧补齐 → 平滑 / 世界点单独平滑 → 手部时序稳定（`hands`）→ yaw → IK 拟合 → 角度与质检。`legacy_postprocess_config()` 可恢复改造前行为，便于 A/B。
 
 6. **骨骼与坐标**  
    `skeleton/mapping.py` 把 MediaPipe 的 33 点映射到 ARKit 关节；`transform.py` 把米制、`y` 向下的世界坐标转换成米制、右手系、`y` 向上、`-z` 向前的导出坐标；`root_motion.py` 生成根平移与四元数旋转。
@@ -625,9 +633,10 @@ AnalysisResult → 预览帧 / 姿态 JSON / 动作 JSON
 | 字段 | 作用 |
 | --- | --- |
 | `sampling` | 采样计划：目标 FPS、stride、时间范围 |
-| `postprocess` | 平滑 / 补帧 / 角度 / 质检 / IK 配置 |
-| `skeleton` | 关节粒度、坐标模式（`world` / `calibrated`）、镜像等 |
+| `postprocess` | 平滑 / 补帧 / 手部稳定 / 角度 / 质检 / IK 配置 |
+| `skeleton` | 关节粒度（`include_optional` / `include_all_joints`）、`root_motion_mode`、起点归零、脚部着地锚定；无 `world/calibrated` 坐标模式，也不做镜像 |
 | `perf` | 队列长度、batch、分段、checkpoint / resume |
+| `refinement` | 手/脸增强：`hands=true`、`face=true`，缺模型自动降级 |
 | `ikFit` | 骨长拟合快捷覆盖；为空时取 `postprocess.ik_fit` |
 | `engine` | `auto` / `mediapipe` / `onnx` |
 | `max_frames` | 调试用，最多分析多少帧 |
@@ -644,7 +653,7 @@ AnalysisResult → 预览帧 / 姿态 JSON / 动作 JSON
 TensorRT > CUDA > CoreML > DirectML > CPU
 ```
 
-`auto` 模式根据探测结果选择：命中前四者视为 GPU 加速，优先尝试 ONNX；否则优先 MediaPipe。档位策略：CPU 强制 `lite`；Apple Silicon 统一内存 ≥16 GB 用 `heavy`、否则 `full`；其它 GPU 显存 ≥8000 MB 用 `heavy`、≥4000 MB 用 `full`、显存未知用 `full`。`DETECT_BODY_PREFER_MODEL_TIER` 只在硬件计划没有给出档位时兜底。
+`auto` 模式根据探测结果选择：命中前四者视为 GPU 加速，优先尝试 ONNX；否则优先 MediaPipe。档位策略：CPU 强制 `lite`；Apple Silicon 统一内存 ≥16 GB 用 `heavy`、否则 `full`；其它 GPU 显存 ≥8000 MB 用 `heavy`、≥4000 MB 用 `full`、显存未知用 `full`。显式设置 `DETECT_BODY_PREFER_MODEL_TIER=lite|full|heavy` 时该值优先级最高，直接决定档位；只有它为 `auto` 时才按上面的 CPU / Apple Silicon / 显存规则推断。
 
 界面「硬件与加速」卡片始终显示，展开后可看 CPU / 内存 / GPU / EP 和选择理由，并能点「重新探测」。NVIDIA 机器需安装 `.[cuda]` 才能启用 CUDA EP；Apple Silicon 使用 onnxruntime 自带 CoreML EP；Windows 的 WebView2 只影响窗口，不影响推理。
 
@@ -653,7 +662,7 @@ TensorRT > CUDA > CoreML > DirectML > CPU
 - 请求优先级：任务里的 `engine` > `DETECT_BODY_POSE_ENGINE` > `auto`；非法字符串静默改为 `auto`。
 - 显式指定 `mediapipe` 或 `onnx` 时，另一个引擎仍会作为备选；因此指定失败会自动降级，界面芯片会显示「· 降级」。
 - 候选依次执行 `availability → create → apply_runtime → prepare`；任一失败记录原因并换下一个。全部失败才抛 `EngineUnavailableError`，错误详情含 `requested/candidates/reasons/hint`。
-- `canPreview` 与 `canExport` 是两个不同能力：推理完成即可预览，后处理/质检完成才可导出。
+- `canPreview` 与 `canExport` 是两个不同能力：推理开始后只要有部分帧即可预览（边算边看），后处理/质检完成才可导出。
 
 ### MediaPipe 引擎
 
@@ -665,14 +674,14 @@ TensorRT > CUDA > CoreML > DirectML > CPU
 | full | `pose_landmarker_full.task` | 默认折中，界面推荐 |
 | heavy | `pose_landmarker_heavy.task` | 精度优先、速度较慢 |
 
-本工作区当前可见 lite / full；`.task` 文件被 `.gitignore` 排除，不会随仓库分发。新克隆后由 bootstrap、模型卡、`POST /api/models/download` 或手动放置获取，heavy 需自行下载。
+本工作区当前可见 lite / full 姿态模型及 `hand_landmarker.task` / `face_landmarker.task` 增强模型；`.task` 文件被 `.gitignore` 排除，不会随仓库分发。新克隆后由 bootstrap、模型卡、`POST /api/models/download` 或手动放置获取，heavy 需自行下载。
 
 重要细节：
 
-- `smooth_landmarks=true` 时进入 `VIDEO` 模式，否则 `IMAGE`；但当前代码没有把 MediaPipe 的 `tracking_ids` 写入 `PoseFrame.track_id`，后处理的多人轨迹筛选对 MediaPipe 结果实际不会触发。
+- `smooth_landmarks=true` 时进入 `VIDEO` 模式，否则 `IMAGE`；MediaPipe 引擎本身不读取其 `tracking_ids`，但 `perf/runner.py` 会给**所有引擎**统一分配 `track_id`（单人恒为 1，多人用 IoU 跟踪），因此后处理轨迹筛选照常生效。
 - `delegate` 默认 CPU；只有 `DETECT_BODY_MEDIAPIPE_GPU_DELEGATE=true` 才请求 GPU，创建失败会记录 note 并回退 CPU。
 - 不支持 batching；`runtime.batch_size` 会退化为逐帧。
-- 手部/面部增强默认关闭，开启后手输出 21 点、脸只保留 13 个语义点（非 468 点），并只挂到第一帧第一个人。
+- 手部/面部增强默认开启：手输出 21 点、脸只保留 20 个语义点（非 468 点）；手按腕点距离匹配到最近的人（超阈值丢弃），脸挂到当前帧第一个人。
 
 ### ONNX 引擎
 
@@ -696,9 +705,18 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 - 官方 base URL：`https://storage.googleapis.com/mediapipe-models`，镜像只替换 host，路径保持一致。
 - 自动下载：`DETECT_BODY_AUTO_DOWNLOAD_MODELS=1`，默认关闭。
 - 界面 / API：模型卡或 `POST /api/models/download`，请求体支持 `kind`（`pose`/`hand`/`face`）、`tier`（`lite`/`full`/`heavy`）、`use_mirror`。勾选 `use_mirror=false` 会强制官方直链，即使服务端配置了镜像。
-- 下载先写 `.part`，256 KiB 分块、60 秒超时，完成后原子替换；同一时刻只跑一个下载任务。
-- `GET /api/models` 返回模型清单、就绪状态和最近下载任务；`poseReady` 只要求任意一档姿态模型存在。
+- 下载先写 `.part`，256 KiB 分块、60 秒超时，完成后原子替换；同一文件同时只跑一个下载任务（同名任务复用），不同文件可并发。
+- `GET /api/models` 返回模型清单、就绪状态、`mirrorConfigured` 和最近 6 条下载任务；`poseReady` 只要求任意一档姿态模型存在。
 - 源码运行时模型目录默认是仓库根 `models/`；打包后默认是 `~/.detect-body/models`。
+
+### 应用内 GPU 运行时安装
+
+除了用 `bootstrap.ps1 -Cuda` / `bootstrap.sh --cuda` 在开发环境预装 CUDA 版 onnxruntime，应用内还提供一套**免管理员权限**的 GPU 运行时安装流程（后端 `engine/accelerator_install.py`，API `/api/runtime/*`，前端嵌在「硬件与加速」卡片里）：
+
+- 检测到 GPU 但当前没有可用加速 EP 时，卡片会列出可安装变体：`cuda`（`onnxruntime-gpu>=1.22` + cuDNN/cuBLAS 12，约 1.3 GB，NVIDIA 优先）与 `directml`（`onnxruntime-directml>=1.20`，约 350 MB，Windows 上 AMD/Intel 也可用）。不满足条件（如 CUDA 版本低于 12）的变体会显示阻塞原因并禁用安装。
+- 安装用 `pip --target` 写入 `~/.detect-body/runtime/<variant>` 独立目录，**不改动当前 Python 环境**；已有 CPU 版始终保留作兜底，删除目录即可回滚。前端 700 ms 轮询安装进度，显示百分比、日志尾部，可取消安装；单次 pip 尝试 10 分钟超时，最多 3 次。
+- 安装完成后提示「重启应用后生效」：onnxruntime 的动态库已被当前进程加载，无法热切换，需点「重启应用」（`POST /api/runtime/restart`，不支持时显示原因）或手动重启。已安装但未激活的运行时可「切换」/「移除」；移除会回滚到 CPU 版。
+- `GET /api/runtime/accelerators` 返回可选项、已安装项、当前激活变体、当前 EP、`gpuAccelerated`、`restartRequired` 与安装任务状态；相关 API 见「HTTP API」。
 
 ---
 
@@ -710,13 +728,14 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 
 | 卡片 | 显示条件与内容 |
 | --- | --- |
-| 模型卡 | 仅「模型清单未返回 / 姿态模型未就绪 / 正在下载 / 出错」时显示；只列 lite/full/heavy 三档姿态模型，已就绪后自动消失 |
+| 模型卡 | 清单已返回但姿态模型缺失 / 推荐档位缺失（标题变「推荐档位模型未就绪」）/ 下载中 / 出错时显示；只列 lite/full/heavy 三档姿态模型，清单未返回时反而不显示 |
 | 拍摄建议 | 始终显示，默认折叠；首次打开另有一次性弹窗 |
-| 识别设置 + 数据质检 | 导入视频后出现；两个 section 合并在同一卡片组内 |
-| 导出 | 导入视频后出现；按钮只有任务 `done` 时可用 |
-| 3D 预览 | 导入视频后出现；用 ARKit 关节渲染，可拖拽旋转、滚轮缩放 |
-| 视频信息 / 运行环境 | 未导入视频时显示运行环境（版本、Python、系统、服务状态）；导入后换成视频信息 |
-| 硬件与加速 | 始终显示；可点「重新探测」 |
+| 识别设置 + 数据质检 | 导入视频后出现；两个 section 合并在同一卡片组内；底部有「清空缓存」按钮 |
+| 导出 | 导入视频后出现；按钮只有任务 `done` 时可用；顶部状态栏也有等效导出按钮 |
+| 3D 预览 | 导入视频后出现；用 ARKit 关节渲染，可拖拽旋转、滚轮缩放，显示地面网格与坐标轴 |
+| Mesh 白膜预览 | 导入视频后出现；Three.js Marching Cubes 把关键点展开为带胸腔/四肢的人形隐式曲面，头颅与五指单独建模，可拖拽旋转、滚轮缩放；白膜是姿态驱动的近似体型，不代表真实外观 |
+| 视频信息 / 运行环境 | 未导入视频时显示运行环境（版本、Python、系统、服务状态）与使用流程；导入后换成视频信息，使用流程消失 |
+| 硬件与加速 | 始终显示；可点「重新探测」；GPU 未启用加速时内嵌「GPU 加速」安装区（见「应用内 GPU 运行时安装」） |
 | 使用流程 | 仅在未导入视频时显示，引导上传 → 识别 → 导出 |
 
 ### 视频舞台与骨架叠加
@@ -725,7 +744,7 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 - 默认：骨架开、关键点编号关、检测框开、连线实线。`visibility < 0.05` 的点不画；按可见度分三档颜色。
 - 鼠标靠近关键点 14 px 内显示中文点位名、归一化 x/y/z 与置信度；检测框为青色虚线。
 - 关闭「骨架」后检测框也不会绘制；「编号」开关在窄屏隐藏但状态仍有效。
-- 骨架取「最后一个 `t <= currentTime`」的帧，不是绝对时间最近的帧；`valid=false` 时左下角提示「本帧无有效姿态」。
+- 骨架取「最后一个 `t <= currentTime`」的帧，不是绝对时间最近的帧；`valid=false` 时左下角提示「本帧无有效姿态（valid=false）」。
 - 3D 预览使用米制 ARKit 关节，跟随主题调整骨骼颜色，显示地面网格与坐标轴。
 
 ### 播放与时间轴
@@ -748,7 +767,7 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 | `T` | 切换主题 |
 | `S` | 显示 / 隐藏骨架 |
 
-`Ctrl/Cmd/Alt` 组合键不触发全局快捷键；焦点在 `input/textarea/select/button/a/contenteditable` 内也不触发。时间轴自身聚焦后 `←/→` 是 ±1 秒、`Shift+←/→` 是 ±5 秒。主题默认深色，切换写入 `localStorage['detect-body-theme']`，不跟随系统主题。拍摄建议弹窗关闭状态写入 `localStorage['detect-body:shooting-guide-seen']`。
+`Ctrl/Cmd/Alt` 组合键不触发全局快捷键；焦点在 `input/textarea/select/button/a/contenteditable` 内也不触发。时间轴自身聚焦后 `←/→` 是 ±1 秒、`Shift+←/→` 是 ±5 秒（事件仍冒泡到全局处理器，会再叠加一次逐帧步进）。右侧栏宽度可拖拽调整、双击分隔条复位，宽度写入 `localStorage['detect-body-side-panel-width']`。主题默认深色，切换写入 `localStorage['detect-body-theme']`，不跟随系统主题。拍摄建议弹窗关闭状态写入 `localStorage['detect-body:shooting-guide-seen']`。
 
 ---
 
@@ -836,8 +855,8 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | `DETECT_BODY_IK_FIT_MAX_NFEV` | `60` | 每帧求解函数求值上限，1–500 |
 | `DETECT_BODY_IK_FIT_FOV_DEGREES` | `60.0` | 相机水平视场角，10–150 度 |
 | `DETECT_BODY_Z_SMOOTHING_SCALE` | `0.3` | Z 轴 min_cutoff 相对 x/y 的系数 |
-| `DETECT_BODY_WEBVIEW_DEBUG` | 空 | 设置任意值打开 pywebview debug |
-| `DETECT_BODY_CONSOLE` | `1` 时保留 | PyInstaller 打包时保留控制台，调试用 |
+
+> 另有两个**不由 `Settings` 解析**的环境变量：`DETECT_BODY_WEBVIEW_DEBUG`（设置任意值打开 pywebview debug，由 `app/desktop/main.py` 直接读取）与 `DETECT_BODY_CONSOLE`（值为 `1` 时打包保留控制台，由 `scripts/package.*` 在打包阶段读取）。它们不会出现在 `Settings` 字段中。
 
 ### 单次分析配置（AnalysisOptions）
 
@@ -846,26 +865,27 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `sampling` | `SamplingConfig()` | `every_n_frames=1`、`target_fps=null`、`start_s=null`、`end_s=null`、`trim_empty=false` |
-| `postprocess` | `PostProcessConfig()` | One Euro、补帧、角度、质检、IK、yaw 全套默认配置 |
-| `skeleton` | `SkeletonConfig()` | 不含可选关节、root motion `world`、`anchor_feet_to_ground=true`（脚部着地锚定）、`include_all_joints=false` |
+| `postprocess` | `PostProcessConfig()` | One Euro、补帧、手部稳定、角度、质检、IK、yaw 全套默认配置 |
+| `skeleton` | `SkeletonConfig()` | 不含可选关节、root motion `world`、`anchor_feet_to_ground=true`（脚部着地锚定）、`include_all_joints=false`；无坐标模式 / 镜像字段 |
 | `perf` | `RuntimeConfig()` | 队列 64、batch 4、worker 0、fp16 `auto`、分段 0、checkpoint/resume `false` |
-| `refinement` | `RefinementConfig()` | 手/脸增强：`hands=true`、`face=true`、`max_hands=2`、`refine_landmarks=true`；缺模型自动降级 |
+| `refinement` | `RefinementConfig()` | 手/脸增强：`hands=true`、`face=true`、`max_hands=2`、`num_faces=1`、`min_detection_confidence=0.5`、`hand_detection_confidence=0.4`、`hand_presence_confidence=0.35`、`refine_landmarks=true`、`hand_model=null`、`face_model=null`；缺模型自动降级 |
 | `ikFit` / `ik_fit` | `null` | 骨长拟合快捷覆盖；HTTP 别名是 `ikFit` |
 | `engine` | `auto` | `auto` / `mediapipe` / `onnx` |
 | `max_frames` | `null` | 调试用最大帧数 |
 
 关键嵌套默认值：
 
-- `postprocess`：`estimate_orientation=true`、`compute_angles=true`、`fps=30.0`、`stride=1`。
-- 平滑：`method=one-euro`、`window=5`、`polyorder=2`、`extra_world_pass=true`；归一化点 x/y 的 One Euro 为 `1.0/0.5/1.0`，z 为 `0.3/0.15/1.0`；世界点另有一组参数。
+- `postprocess`：`estimate_orientation=true`、`compute_angles=true`、`fps=30.0`、`stride=1`、`target_track_id=null`。
+- 平滑：`method=one-euro`、`window=5`、`polyorder=2`、`extra_world_pass=true`；归一化点 x/y 的 One Euro 为 `1.0/0.5/1.0`，z 为 `0.3/0.15/1.0`；世界点另有独立一组 `1.0/1.0/1.0`，z 为 `0.3/0.3/1.0`（米制量级不同，不能共用参数）。
 - 补帧：可见度阈值 0.5、至少 6 个点、`score>=0.4`、最多补 5 帧内部缺口；片头片尾与长缺口保持 `valid=false`。
-- 角度：9 个名称（左右肘/肩/膝/髋 + `torso_lean`），优先用 world 点，缺 33 点时回退归一化点，退化角直接省略。
-- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`；只改 world 点，不改 2D 关键点。
+- 手部稳定（`hand_stability`）：手部 21 点默认开启掉帧补全、姿态迟滞与相对姿态平滑；可在 A/B 时整体关闭。
+- 角度：9 个名称（左右肘/肩/膝/髋 + `torso_lean`），优先用 world 点，缺 33 点时回退归一化点，退化角由 `compute_angles()` 直接省略；导出的 `attach_angles()` 在短时遮挡时会沿用上一有效角度，默认最多保持 15 帧（`hold_occluded_frames`）。
+- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`、`root_prior_weight=0.2`、`depth_prior_weight=0.5`、`aspect_ratio` 缺省 `9/16`、`refine_tolerance=0.01`、`bone_sample_min_projected_ratio=0.85`、`symmetrize_bones=true`、`max_left_right_asymmetry=0.08`，遮挡期还有 `occlusion_weight=1.5`、`occlusion_max_frames=30`、`occlusion_jump_degrees=75`、`max_reproj_error=0.05`；只改 world 点，不改 2D 关键点。
   - `depth_flat_weight` 是**深度压平先验**：按「骨段投影长度 / 标定骨长」的比例（`^gate_power` 门控）把不可观测的视线方向分量压向 0。正面站直的视频不会再被解成"侧视屈膝"；骨段真的朝向镜头（前伸的胳膊）时先验自动失效。设为 `0` 可回到旧行为。
   - `rigidify_failed_frames` 让 IK 被跳过的有效帧（可见度不足 / 尺度估计失败 / 2D 不自洽）也按「观测方向 + 标定骨长」重建，保证整段视频骨长恒定；单骨段位移超过 `rigidify_max_joint_shift`（默认 0.12 m）时才原样透传。
 - 质检：有效帧 ready/review 阈值 `0.95/0.8`，z 抖动 `0.01/0.03 m`，骨长 CV `0.10/0.30`，深度置信度门禁 0.6。
 
-界面提交的值与后端裸默认值不同：界面强制 `skeleton.include_optional=true`、`include_all_joints=true`、`root_motion_mode` 默认 `world`、`resume/checkpoint=true`、`batch_size=4`、`ikFit.enabled` 随引擎能力开关。API 直接调用时不会自动套用这些界面值。
+界面提交的值与后端裸默认值不同：界面强制 `skeleton.include_optional=true`、`include_all_joints=true`、`root_motion_mode` 默认 `world`、`resume/checkpoint=true`、`batch_size=4`、`refinement.hands/face=true`（无开关）、`ikFit.enabled` 随引擎能力开关。API 直接调用时不会自动套用这些界面值。
 
 > `DETECT_BODY_RUNTIME_*` 和 `DETECT_BODY_IK_FIT_*` 只提供服务端默认值；`pipeline.py` 默认构造 `RuntimeConfig()`，并不会自动读取 `RuntimeConfig.from_settings()`。要让环境变量覆盖单次任务，请在请求体中显式传对应字段。IK 的环境变量覆盖只在未提供 `ikFit` 时生效。
 
@@ -878,7 +898,7 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 API 约定：
 
 - 业务错误统一返回 `{"error": {"code": "...", "message": "...", "details": {...}}}`。常见 code：`validation_failed` (422)、`unsupported_media` (415)、`payload_too_large` (413)、`not_found` (404)、`conflict` (409)、`analysis_cancelled` (409)、`service_unavailable` (503)、`export_failed` / `export_validation_failed` (500)。
-- 任务状态和结果只存内存，服务重启后任务消失；断点文件独立保存在 `~/.detect-body/checkpoints/`。`AnalysisJobManager` 最多保留 8 个任务，超出时清理最老的已结束任务。
+- 任务状态和结果只存内存，服务重启后任务消失；断点文件独立保存在 `~/.detect-body/checkpoints/`。`AnalysisJobManager` 默认最多保留 8 个任务；超出时只从**已结束**任务中淘汰最老的，若 8 个任务都在运行则会暂时超过该数。
 - 一次性上传上限 8 GiB；超过 16 MiB 的前端会自动改走分块接口，块大小由 `POST /videos/uploads` 返回的会话决定。
 - `GET /analysis/{id}/frames` 只在 `canPreview` 后可读；推理期间返回原始预览帧，完成后切换到最终后处理帧。`limit` 默认 2000、最大 8000；前端按 4000 一页、最多 100000 帧分页加载。
 - 导出只有 `canExport`（任务 `done`）后才允许；`downloadUrl` 仅在输出目录等于默认 `exports_dir` 时返回。
@@ -910,8 +930,14 @@ API 约定：
 | `GET` | `/api/exports/schema` | 下载姿态 JSON Schema |
 | `GET` | `/api/exports` | 导出文件列表 |
 | `GET` | `/api/exports/{filename}` | 下载导出文件 |
-| `GET` | `/api/models` | 模型就绪状态与下载任务 |
+| `GET` | `/api/models` | 模型就绪状态、镜像配置与最近 6 条下载任务 |
 | `POST` | `/api/models/download` | 启动模型下载 |
+| `GET` | `/api/runtime/accelerators` | GPU 运行时选项、已安装/激活状态与安装任务 |
+| `POST` | `/api/runtime/accelerators/install` | 启动 CUDA / DirectML 运行时安装（body: `{"variant":"cuda"\|"directml"}`） |
+| `POST` | `/api/runtime/accelerators/install/cancel` | 取消当前安装任务 |
+| `POST` | `/api/runtime/accelerators/{variant}/activate` | 切换激活的运行时（重启后生效） |
+| `DELETE` | `/api/runtime/accelerators/{variant}` | 移除已安装运行时并回滚到 CPU |
+| `POST` | `/api/runtime/restart` | 重启应用以加载新运行时 |
 
 ### 典型请求
 
@@ -1099,10 +1125,10 @@ pytest tests/test_export.py -q
 | --- | --- |
 | `keypoints` | 18 个 ARKit 核心关节 + 可选关节；界面提交 `include_all_joints=true` 时为 91 个，无角度 |
 | `full` | 关键点 + 关节角度，默认；界面会自动附带原始 33 点，并输出 91 个关节 |
-| `compact` | 只保留 18 个 ARKit 核心关节，无角度、无原始 33 点 |
+| `compact` | 只保留 18 个 ARKit 核心关节，无角度；UI 不带原始 33 点，但 API 显式传 `include_raw_landmarks=true` 仍会附带（此时写出器按 `keypoints` 回执/命名） |
 
 界面识别设置默认提交 `skeleton.include_all_joints=true`，导出 `jointNames` 与
-`resources/AppleModel.usda` 的 91 个关节**逐项同名同序**（含双手各 24 个指关节、
+`resources/AppleModel.usda` 的 91 个关节**逐项同名同序**（顺序以 `app/backend/skeleton/mapping.py::APPLE_ALL_JOINTS` 为准；`resources/` 被 gitignore，本工作区已有该文件，新克隆需自行放置；含双手各 24 个指关节、
 脊柱 1–7、颈 1–4、下颌/鼻/眼/眼睑/虹膜、脚尖末端）。API 直接调用默认仍是旧 18/22
 关节，保持向后兼容；显式传 `include_all_joints=true` 即可开启全关节。增强关节的
 坐标是估计值：`world` 模式以对应姿态腕点/鼻点为锚、按局部尺度换算，无尺度时记入
@@ -1110,17 +1136,18 @@ pytest tests/test_export.py -q
 
 > 界面按钮的说明文案与代码有出入：卡片把 `compact` 写成「关键帧 + 角度」、把 `keypoints` 写成「只有关键点与角度」，但实际只有 `full` 导出 `angles`。以本表和 `app/backend/export/builder.py` 为准。另外，`root` 与 `hips_joint` 都取自两髋中点，不是两个独立关节；`joints` 是相对 root 的位移。
 
-质量报告 `quality` 的关键字段：`validFrameRatio`、`meanVisibility`、`meanScore`、`maxJump`、`zJitterRms`、`boneLengthCv`、`meanReprojError`、`depthConfidence`、`verdict`（`ready` / `review` / `rerecord`）、`verdictLabel`、`issues`、`smoothing`、`notes`。
+质量报告 `quality` 的关键字段：`framesTotal`、`framesValid`、`validFrameRatio`、`interpolatedFrames`、`meanVisibility`、`meanScore`、`maxJump`、`maxJumpFrame`、`zJitterRms`、`boneLengthCv`、`meanReprojError`、`depthConfidence`、`verdict`（`ready` / `review` / `rerecord`）、`verdictLabel`、`issues`、`smoothing`、`notes`。拍摄机位/距离指标的中间报告 `framing` 只存在于内部 `QualityReport`，导出时折算进 `issues` / `warnings`，不作为 `quality` 字段写出。
 
 `depthConfidence` 的计算：
 
 ```text
-confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
-                + 0.3 * min(1, 骨长CV / 0.30)
-                + 0.2 * min(1, 重投影误差 / 0.02))
+无 world landmarks（如 ONNX 引擎）        → confidence = 0.0
+否则 confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
+                     + 0.3 * min(1, 骨长CV / 0.30)
+                     + 0.2 * min(1, 重投影误差 / 0.02))
 ```
 
-判读：≥0.75 可信；0.5–0.75 一般；<0.5 不可信；低于 0.6 时结论最多只到 `review`。
+判读：≥0.75 可信；0.5–0.75 一般；<0.5 不可信。只有**有世界坐标且** `quality.enable_depth_gate=true` 时，`confidence < 0.6` 才会把 `ready` 压到 `review`；无 world 时不降级。内部 `framing` 指标只追加 issues，不改变 verdict。
 
 版本规则：同一 major（`1.x`）向后兼容，新增字段必须可选且带默认值；改名、改单位、改必填必须升 major。
 
@@ -1133,6 +1160,9 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 | `schemaVersion` | 当前为 `1` |
 | `exerciseID` / `name` / `nameZh` | 动作标识与显示名 |
 | `coordinateSpace` | 恒为 `hip-local-meters-yup` |
+| `bodyOrientation` | 恒为 `upright` |
+| `referenceModel` / `mirroredReference` | 参考骨架标识与镜像约定（默认 `true`） |
+| `jointVisibilityNote` | 可见度缺省规则说明（缺省视为 1） |
 | `sampleIntervalMs` | 默认 `100`，即 10 Hz |
 | `durationMs` | 最后一帧的 `t` |
 | `loop` / `demonstrationLoops` | 循环设置 |
@@ -1150,7 +1180,7 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 | --- | --- |
 | `root` / `pelvis` | `root` / `hips_joint` |
 | `spine` | `spine_3_joint` |
-| `centerShoulder` | `spine_7_joint` |
+| `centerShoulder` | 左右肩关节中点（`spine_7_joint` 只是映射表占位，写出时被中点覆盖） |
 | `neck` | `neck_1_joint` |
 | `left/rightShoulder` | `left/right_shoulder_1_joint` |
 | `left/rightElbow` | `left/right_arm_joint` |
@@ -1183,10 +1213,10 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 | 坐标 | 含义 | 可信度 |
 | --- | --- | --- |
 | `landmarks`（归一化） | `x,y ∈ [0,1]`，`y` 向下；`z` 相对髋中心 | `x/y` 直接来自 2D 检测，亚像素级可信；`z` 是模型估计 |
-| `world_landmarks` | 米制，原点约两髋中点，`y` 向下 | `x/y` 可信；`z` 仅为估计，需尺度标定才换算成米 |
+| `world_landmarks` | 米制，原点约两髋中点，`y` 向下 | 已是米制，`x/y` 可信；`z` 仅为估计，不能当绝对深度 |
 | 导出 `joints` | 米、右手系、`y` 向上、`-z` 向前 | 由上面两者转换，`x/y` 沿用 2D 可信度，`z` 同为估计 |
 
-导出统一转换：`x' = x`、`y' = -y`、`z' = -z`。
+导出统一转换：**先把每个关节减去髋中心（或 root）归零**，再做 `x' = x`、`y' = -y`、`z' = -z`；根平移单独写入 `rootMotion`。
 
 ### 根运动与世界坐标
 
@@ -1194,7 +1224,8 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 - 没有 world landmarks 的引擎（ONNX/RTMPose）不产出米制关节：不再用"身高 ÷ 归一化像素跨度"反解尺度（该尺度随姿态和机位漂移，实测效果明显更差）。
 - `in_place` 根运动模式把平移全部置 0，只保留 yaw 旋转；`world` 模式允许平移。
 - `rootMotion.totalTranslation` 是**末帧相对首帧的直线距离**，不是累计行走路程；其前后（z）分量仍是单目估计值，不可用于测量走了多远。
-- 生产 yaw 用肩/髋投影宽度比估计，符号取自左右肩 world z 差；正对（宽度比 >0.92）时置信度上限 0.45，宽度比 <0.25 退化为 ±90° 且置信度 0.15。旧 `yaw_from_world_z()` 仅保留作对比，不在生产路径使用。
+- IK 拟合的 yaw 先验用肩/髋投影宽度比估计，符号取自左右肩 world z 差；正对（宽度比 >0.92）时置信度上限 0.45，宽度比 <0.25 退化为 ±90° 且置信度 0.15。
+- 导出的 `rootMotion.rotation` 是另一路：默认取左右髋连线的世界坐标 `atan2(-dz, dx)`（`yaw_source="hips"`），与旧的 `yaw_from_world_z()` 同型；旧函数本身仍只作对比、不在该路径调用。
 
 ### 关于 Z / 深度
 
@@ -1248,11 +1279,12 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 ├─ exports/       # 默认导出目录
 ├─ checkpoints/   # *.pose.jsonl 断点续算文件
 ├─ logs/          # 桌面壳与后端日志
+├─ runtime/       # 应用内安装的 CUDA / DirectML 独立后端（按需创建）
 ├─ webview/       # pywebview 本地存储
 └─ models/        # 打包后模型目录
 ```
 
-可修改 `DETECT_BODY_DATA_DIR` 整体迁移；`exports_dir`、`checkpoints_dir`、`logs_dir` 等由 `Settings` 自动派生并在启动时创建。
+可修改 `DETECT_BODY_DATA_DIR` 整体迁移；`exports_dir`、`checkpoints_dir`、`logs_dir` 等由 `Settings` 自动派生并在启动时创建；`runtime/` 由安装动作按需创建。
 
 ---
 
@@ -1260,7 +1292,7 @@ confidence = 1 - (0.5 * min(1, z抖动 / 0.03)
 
 ### 测试
 
-项目包含 17 个测试模块，加上 `conftest.py` 和合成姿态工具 `synth_pose.py`，当前共有 175 个顶层 `test_` 函数（参数化后实际用例更多）。
+项目包含 23 个测试模块，加上 `conftest.py` 和合成姿态工具 `synth_pose.py`，当前共有 237 个顶层 `test_` 函数（参数化后实际用例更多）。
 
 ```bash
 # 全部测试
@@ -1281,16 +1313,22 @@ ruff check app scripts tests
 | --- | --- |
 | `test_acceleration.py` | TensorRT / CUDA / CoreML / DirectML / CPU EP 选择、线程上限、VRAM 边界、fallback |
 | `test_analysis_api.py` | 任务 → 预览帧 → 导出、motion 导出、下载 URL、schema、错误状态 |
+| `test_apple_joints.py` | 91 关节与 `resources/AppleModel.usda` 逐项对齐、手/脸增强映射到 ARKit、左右手分配、world 锚定与无尺度跳过 |
 | `test_depth_fit.py` | 合成真值骨架、骨长保持、重投影改善、yaw prior、禁用与降级 |
 | `test_desktop.py` | 空闲端口、健康检查、WebView2 状态、图标、标题、退出清理 |
 | `test_engine.py` | `PoseFrame` 序列化、bbox、引擎降级、crop、SimCC 解码、COCO17 映射、多人跟踪 |
 | `test_export.py` | 三种粒度、raw landmarks、四位小数、文件名、流式写出与回读、schema 同步、golden 样例 |
+| `test_ground_contact.py` | 脚部着地锚定：踝固定/髋下沉、可关闭、无脚帧跳过、深蹲 bundle 回归 |
+| `test_hand_stability.py` | 手部 21 点时序稳定：缺帧复用、长缺口不伪造、单帧误检拒绝、迟滞/确认帧、左右手按腕点归属、pipeline 阶段上报 |
 | `test_hardware_collect.py` | 系统信息采集鲁棒性与报告结构 |
 | `test_models_api.py` | 模型清单、下载进度、重复任务复用 |
 | `test_motion_clip.py` | 动作 JSON 字段、17 关节、10 Hz 重采样、可见性、骨盆升降、CLI |
+| `test_occlusion_hold.py` | 肢体互相遮挡时关节角保持与释放、关闭时的劣化对照 |
 | `test_perf.py` | batch、checkpoint resume、坏行容错、计划 key |
 | `test_pipeline.py` | 端到端分析、取消、`max_frames` |
 | `test_postprocess.py` | One Euro、移动平均 / SAVGOL、补帧、角度、质检 verdict、深度警告 |
+| `test_resume_preview.py` | 取消 → 断点续算时预览必须包含此前已完成帧 |
+| `test_runtime_api.py` | GPU 加速决策（NVIDIA/AMD/Apple/旧驱动/frozen）、一键安装任务、重试/超时/重复/回滚、`/api/runtime` 接口 |
 | `test_skeleton.py` | ARKit 映射、左右不交换、镜像、2D/3D roundtrip、root motion、yaw、无 world 回退 |
 | `test_upload_api.py` | 上传去重、缩略图、坏文件拒绝、plan、分块上传、缺块 |
 | `test_video_media.py` | 视频探测、缩略图、逐帧读取、stride、时间范围、随机访问、采样计划 |
@@ -1302,6 +1340,7 @@ ruff check app scripts tests
 - OpenCV 缺少 `mp4v` 编码器时，合成视频 fixture 会跳过。
 - `skeleton.orientation` 导入失败时，yaw 测试整体跳过。
 - `resources/air-squat-motion.json` 未放置时，动作样例子集测试跳过。
+- `test_apple_joints.py` 直接读取工作区的 `resources/AppleModel.usda`，没有 skip 保护；新克隆的仓库需自行放置该参考文件，否则该模块会失败。
 
 ### 基准
 
@@ -1402,7 +1441,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 | 缺 `msvcp140.dll` / `vcruntime140.dll` | 安装 VC++ 2015–2022 Redistributable |
 | Windows SmartScreen / 杀毒误报 | PyInstaller 产物常见；代码签名或加白名单 |
 | macOS Gatekeeper 拦截 | 右键打开，或 `xattr -dr com.apple.quarantine /Applications/DetectBodyInVideo.app` |
-| 端口占用 | 桌面壳自动选空闲端口；服务模式用 `--port` 指定 |
+| 端口占用 | 未显式传 `--port` 时桌面壳自动选空闲端口；显式指定占用端口会健康检查超时退出，需换端口 |
 | 健康检查超时 | 查 `~/.detect-body/logs`；桌面壳 30 秒未就绪会返回退出码 1 |
 | 测试无法生成视频 | 当前 OpenCV 缺 `mp4v` 编码器时 fixture 会跳过 |
 | 基准结果看起来很好但不真实 | `stub` 只是链路自检；真实性能需用 `--engine auto|mediapipe|onnx` 重跑 |
@@ -1421,15 +1460,15 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 - `mirroredReference` 固定为 `true`（与 App 样例一致）；自拍镜像需额外处理。
 - `pelvisOffsetMeters` 靠着地锚定只能还原下蹲 / 屈膝下沉，无法还原跳跃腾空。
 - ONNX 引擎只接受 COCO 17 点模型，不输出 `z` / world landmarks；多人能力只由文件名中的 `rtmo` 判断。
-- MediaPipe 的 VIDEO 模式没有写入 `track_id`，后处理的多人轨迹筛选对它实际不生效；显式指定引擎失败也会自动降级到另一引擎。
+- MediaPipe 引擎不直接使用其 VIDEO 模式的 `tracking_ids`；`track_id` 由 `perf/runner.py` 统一分配（单人恒为 1，多人 IoU 跟踪），后处理轨迹筛选照常生效；显式指定引擎失败也会自动降级到另一引擎。
 - 补帧只处理长度 ≤5 的内部缺口；片头片尾和长缺口保持 `valid=false`。`densify(stride>1)` 在末帧不对齐步长时可能漏掉末帧。
 - IK 只修改 world 点、不改 2D 关键点；根平移只优化 x/y，z 沿用引擎估计值。无 SciPy 时仅做骨长钳制，不做最小二乘优化。
 - 深度压平先验是**用精度换合理性**：它会让重投影误差从约 5 px 升到约 9 px（1080p，0.5% 画面高度以内），换来的是不再凭空出现十几厘米的屈膝。需要极限 2D 一致性时把 `depth_flat_weight` 调低到 0.5 或 0。
-- 补帧现在同时插值 `world_landmarks`；若仍出现"整条轨迹回退标定模式"的提示，说明该视频有有效帧真的没有世界坐标（例如 ONNX 引擎），此时时间更长、尺度由归一化跨度反解。
-- 任务结果与预览只在内存，服务重启后任务丢失；断点文件独立保存在 `~/.detect-body/checkpoints/`，其 key 由文件名、大小、mtime 和采样计划组成，不是内容 hash。
+- 补帧现在同时插值 `world_landmarks`；若有效帧本身没有世界坐标（例如 ONNX 引擎），导出 3D 关节为空并在 `notes` 提示改用能输出 world landmarks 的引擎，不会回退到身高标定反解。
+- 任务结果与预览只在内存，服务重启后任务丢失；断点文件独立保存在 `~/.detect-body/checkpoints/`，其 key 由版本号、文件名/大小/mtime、探测到的 fps/帧数和采样计划共同派生（SHA-1 前 16 位），不是内容 hash。
 - 导出回读校验是一次性 `read_text()`，超大文件会占用内存；写出本身是流式的。
-- 仓库不含真实视频基准素材，也不含 `resources/AppleModel.usda`、`demo.mp4`、`air-squat-motion.json`，这些文件按 `.gitignore` 排除。
-- `.task` / `.onnx` 权重按 `.gitignore` 排除；新克隆需要下载或手动放置。本工作区当前有 lite/full，heavy 缺失。
+- 仓库（Git 分发）不含真实视频基准素材，也不含 `resources/AppleModel.usda`、`demo.mp4`、`air-squat-motion.json`，这些文件按 `.gitignore` 排除；**本工作区已存在这三个参考文件**，新克隆需自行放置。
+- `.task` / `.onnx` 权重按 `.gitignore` 排除；新克隆需要下载或手动放置。本工作区当前有 lite/full 姿态模型与 hand/face 增强模型，heavy 缺失。
 - `scripts/bench.py` 默认 `stub` 只做链路自检；`scripts/bench_depth.py --engine` 未传入 `AnalysisOptions`，不能用于引擎对比。
 - 界面导出粒度的说明文案与代码不一致，只有 `full` 会输出 `angles`；见「导出格式」。
 - `DETECT_BODY_API_PREFIX` 和 Vite `/api` 代理目标都不要随意改：桌面壳健康检查硬编码 `/api/health`。

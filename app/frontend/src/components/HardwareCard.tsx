@@ -1,5 +1,7 @@
 import { providerLabel, type HardwareReport } from '../api/hardware'
+import { useAccelerators } from '../hooks/useAccelerators'
 import { AlertIcon, CheckIcon } from './icons'
+import { RuntimeInstallPanel } from './RuntimeInstallPanel'
 
 function formatGb(mb: number | null | undefined): string {
   if (!mb) return '未知'
@@ -36,6 +38,8 @@ export function HardwareCard({ report, loading, error, onRefresh }: HardwareCard
   const plan = report?.acceleration
   const avx2 = avxLabel(system?.cpu.avx2 ?? null)
   const gpuIdle = Boolean(system?.gpus.length) && !plan?.gpu_accelerated
+  const accelerators = useAccelerators()
+  const pendingRestart = Boolean(accelerators.payload?.restartRequired)
 
   return (
     <section className="card">
@@ -122,9 +126,13 @@ export function HardwareCard({ report, loading, error, onRefresh }: HardwareCard
           {gpuIdle ? (
             <p className="mt-2 flex items-start gap-1.5 rounded-lg border border-warn/25 bg-warn/10 px-2.5 py-2 text-2xs leading-relaxed text-warn">
               <AlertIcon className="mt-0.5 h-3 w-3 shrink-0" />
-              检测到 GPU，但 onnxruntime 未启用对应 EP，当前仍为 CPU 推理。
+              {pendingRestart
+                ? '已安装 GPU 运行时，重启应用后启用 GPU 推理。'
+                : '检测到 GPU，但 onnxruntime 未启用对应 EP，当前仍为 CPU 推理。'}
             </p>
           ) : null}
+
+          <RuntimeInstallPanel accelerators={accelerators} onRefreshHardware={onRefresh} />
 
           {system?.notes.length ? (
             <ul className="mt-2 space-y-1 border-t border-line pt-2">

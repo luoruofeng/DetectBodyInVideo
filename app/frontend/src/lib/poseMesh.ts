@@ -25,6 +25,13 @@ const WHITE = 0xf8fbff
 /** 白膜半径按关键点量出的体格等比缩放；参考值取成年人站立高度。 */
 const REFERENCE_STATURE = 1.9
 
+/**
+ * 腰腹半宽（米，1.9m 基准）。两条大腿的直径之和 ≤ 腰直径：
+ * 单腿半径取腰半宽的 45%，两条合计 90% 腰宽，中间还留出裆部间隙。
+ */
+const WAIST_HALF_WIDTH = 0.11
+const UPPER_THIGH_RADIUS = WAIST_HALF_WIDTH * 0.45
+
 /** 髋局部坐标下的兜底姿态；仅用于补齐缺失关节，避免曲面断裂。 */
 const REST_JOINTS: Record<string, Vec3Tuple> = {
   root: [0, 0, 0],
@@ -68,6 +75,49 @@ function readJoint(frame: PreviewFrame | null, name: string): THREE.Vector3 | nu
 
 function midpoint(a: THREE.Vector3, b: THREE.Vector3): THREE.Vector3 {
   return a.clone().lerp(b, 0.5)
+}
+
+/** 把 a→b 投影到与 up 垂直的平面，得到稳定的身体横向轴。 */
+function projectedAxis(
+  from: THREE.Vector3,
+  to: THREE.Vector3,
+  up: THREE.Vector3,
+  fallback: THREE.Vector3,
+): THREE.Vector3 {
+  const axis = to.clone().sub(from)
+  axis.addScaledVector(up, -axis.dot(up))
+  if (axis.lengthSq() < 1e-8) {
+    axis.copy(fallback).addScaledVector(up, -fallback.dot(up))
+  }
+  if (axis.lengthSq() < 1e-8) {
+    axis.set(1, 0, 0).addScaledVector(up, -up.x)
+    if (axis.lengthSq() < 1e-8) axis.set(0, 0, 1).addScaledVector(up, -up.z)
+  }
+  return axis.normalize()
+}
+
+/**
+ * 股骨头（大腿根）位置：两髋间距按腰宽钳制，避免误检把大腿甩到腰外；
+ * 髋口球心略低于骨盆、略内收，衔接是渐变的楔形而不是横跨两髋的粗球链。
+ */
+function thighRootPoint(
+  hip: THREE.Vector3,
+  hips: THREE.Vector3,
+  hipAxis: THREE.Vector3,
+  up: THREE.Vector3,
+  sideSign: number,
+  scale: number,
+  maxDrop: number,
+): THREE.Vector3 {
+  const relative = hip.clone().sub(hips)
+  const minOffset = UPPER_THIGH_RADIUS * 1.08 * scale
+  const maxOffset = (WAIST_HALF_WIDTH - UPPER_THIGH_RADIUS) * scale
+  const offset = sideSign * clamp(Math.abs(relative.dot(hipAxis)), minOffset, maxOffset)
+  const tilt = clamp(relative.dot(up), -0.025 * scale, 0.012 * scale)
+  return hips
+    .clone()
+    .addScaledVector(hipAxis, offset)
+    .addScaledVector(up, tilt - Math.min(0.03 * scale, maxDrop))
 }
 
 /** 将 PreviewFrame.joints 补齐成白膜构建所需的完整关节集合。 */
@@ -214,6 +264,10 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
   const { up, lateral, front } = bodyBasis(joints)
   const shoulderSpan = leftShoulder.distanceTo(rightShoulder)
   const chestHalf = clamp(shoulderSpan * 0.2, 0.06, 0.1)
+  // 髋横轴优先取两髋连线（投影到骨盆平面），比肩线更贴近下半身的实际朝向。
+  const hipAxis = projectedAxis(rightHip, leftHip, up, lateral)
+  const hipSocketRadius = UPPER_THIGH_RADIUS * 0.98
+  const kneeRadius = UPPER_THIGH_RADIUS * 0.78
 
   const addBall = (point: THREE.Vector3, radius: number, color = WHITE) => {
     const scaled = radius * s
@@ -280,13 +334,15 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
   }
 
   // ── 骨盆与腰腹 ────────────────────────────────────────────────
-  addBall(hips, 0.115)
-  addBall(hips.clone().addScaledVector(front, -0.03).addScaledVector(up, -0.01), 0.1)
-  addLimb(leftHip, rightHip, 0.07, 0.07)
-  addBall(leftHip, 0.078)
-  addBall(rightHip, 0.078)
+  // 骨盆上口接腰、下口分成两条独立的股骨通道；不再横跨两髋拉粗球链，
+  // 否则两腿会和胯糊成一整块，外沿比腰还宽。
+  addBall(hips, WAIST_HALF_WIDTH * 0.98)
+  addBall(
+    hips.clone().addScaledVector(front, -0.03).addScaledVector(up, -0.01),
+    WAIST_HALF_WIDTH * 0.9,
+  )
 
-  addLimb(hips, spine3, 0.108, 0.1)
+  addLimb(hips, spine3, WAIST_HALF_WIDTH * 0.95, WAIST_HALF_WIDTH * 0.88)
   addLimb(spine3, spine7, 0.102, 0.122)
   addBall(spine7, 0.126)
   addBall(spine7.clone().addScaledVector(front, 0.02), 0.11)
@@ -325,11 +381,18 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
     const ankle = get(`${side}_foot_joint`)
     const toes = get(`${side}_toes_joint`)
 
-    addBall(hip, 0.08)
-    addLimb(hip, knee, 0.086, 0.055)
-    addBall(knee, 0.055)
-    addLimb(knee, ankle, 0.056, 0.034)
-    addBall(ankle, 0.036)
+    // 用钳制后的大腿根代替原始髋点：误检/大劈叉时大腿也不会比腰还粗。
+    const sideSign = side === 'left' ? 1 : -1
+    const root = thighRootPoint(hip, hips, hipAxis, up, sideSign, s, hip.distanceTo(knee) * 0.12)
+    const socket = root.clone().addScaledVector(front, -0.012 * s).addScaledVector(up, 0.008 * s)
+    addLimb(hips, socket, WAIST_HALF_WIDTH * 0.7, hipSocketRadius)
+    addBall(socket, hipSocketRadius)
+    addBall(socket.clone().addScaledVector(front, -0.016 * s), hipSocketRadius * 0.9)
+
+    addLimb(root, knee, UPPER_THIGH_RADIUS, kneeRadius)
+    addBall(knee, kneeRadius)
+    addLimb(knee, ankle, kneeRadius * 0.94, 0.032)
+    addBall(ankle, 0.033)
     addFoot(ankle, toes)
   }
 

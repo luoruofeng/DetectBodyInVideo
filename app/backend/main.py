@@ -19,6 +19,10 @@ from app.backend.api import api_router
 from app.backend.core.errors import AppError
 from app.backend.core.logging import setup_logging
 from app.backend.core.settings import Settings, get_settings
+from app.backend.engine.accelerator_install import (
+    AcceleratorInstallManager,
+    activate as activate_accelerator_runtime,
+)
 from app.backend.engine.model_downloads import ModelDownloadManager
 from app.backend.jobs import AnalysisJobManager
 from app.backend.media.store import VideoStore
@@ -40,6 +44,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    # 必须在任何 import onnxruntime 之前执行：把界面上装好的 GPU 版插到 sys.path 头部
+    activate_accelerator_runtime(settings)
     setup_logging(settings)
 
     app = FastAPI(
@@ -56,6 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.upload_manager = ChunkedUploadManager(settings)
     app.state.analysis_jobs = AnalysisJobManager(settings, app.state.video_store)
     app.state.model_downloads = ModelDownloadManager(settings)
+    app.state.accelerators = AcceleratorInstallManager(settings)
 
     app.add_middleware(
         CORSMiddleware,

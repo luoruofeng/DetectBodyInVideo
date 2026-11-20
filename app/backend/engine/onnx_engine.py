@@ -357,13 +357,15 @@ class OnnxPoseEngine(PoseEngine):
 
     # ---- 选型 ----
     @classmethod
-    def availability(cls, settings: Settings | None = None) -> tuple[bool, str]:
+    def availability(
+        cls, settings: Settings | None = None, plan: object | None = None
+    ) -> tuple[bool, str]:
         try:
             import onnxruntime  # noqa: F401, PLC0415 - 探测用
         except Exception as exc:  # noqa: BLE001
             return False, f"onnxruntime 未安装：{exc}"
         try:
-            resolve_onnx_model(settings=settings, tier=engine_tier(settings, None))
+            resolve_onnx_model(settings=settings, tier=engine_tier(settings, plan))
         except EngineUnavailableError as exc:
             return False, exc.message
         return True, ""
@@ -393,6 +395,13 @@ class OnnxPoseEngine(PoseEngine):
     def prepare(self, device: str | None = None) -> None:
         if self._prepared:
             return
+        # 非 create_app 入口（脚本 / 基准测试）也要保证 GPU 运行时先注入 sys.path
+        try:
+            from app.backend.engine.accelerator_install import activate as _activate_runtime  # noqa: PLC0415
+
+            _activate_runtime(self.settings)
+        except Exception:  # noqa: BLE001 - 激活失败不应阻断引擎
+            logger.debug("加速运行时激活失败", exc_info=True)
         try:
             import onnxruntime as ort  # noqa: PLC0415 - 延迟导入
         except Exception as exc:  # noqa: BLE001

@@ -50,7 +50,9 @@ def create_engine(name: str, **kwargs: Any) -> PoseEngine:
     return factory(**kwargs)
 
 
-def describe_engines(settings: Settings | None = None) -> list[dict[str, Any]]:
+def describe_engines(
+    settings: Settings | None = None, plan: object | None = None
+) -> list[dict[str, Any]]:
     """给 UI 的引擎清单：谁可用、缺什么。"""
     rows: list[dict[str, Any]] = []
     for name in registered_engines():
@@ -58,7 +60,7 @@ def describe_engines(settings: Settings | None = None) -> list[dict[str, Any]]:
         available, reason = (True, "")
         if engine_class is not None:
             try:
-                available, reason = engine_class.availability(settings)
+                available, reason = engine_class.availability(settings, plan=plan)
             except Exception as exc:  # noqa: BLE001 - 探测不允许抛
                 available, reason = False, str(exc)
         rows.append({"name": name, "available": available, "reason": reason})
@@ -103,11 +105,14 @@ def select_engine(
             continue
         engine_class = getattr(_FACTORIES[name], "engine_class", None)
         if engine_class is not None:
-            available, reason = engine_class.availability(settings)
+            available, reason = engine_class.availability(settings, plan=plan)
             if not available:
                 reasons.append(f"{name} 不可用：{reason}")
                 logger.info("跳过引擎 %s：%s", name, reason)
                 continue
+            if reason:
+                # 例如“heavy 档模型缺失，已回退 full”，要让用户看到降级原因。
+                reasons.append(f"{name}：{reason}")
 
         engine: PoseEngine | None = None
         try:
@@ -132,7 +137,12 @@ def select_engine(
             display_name=engine.display_name,
             requested=requested,
             degraded=index > 0,
-            reasons=reasons + engine.notes,
+            reasons=reasons
+            + [
+                note
+                for note in engine.notes
+                if note not in reasons and f"{engine.name}：{note}" not in reasons
+            ],
             capabilities=engine.capabilities,
             model_tier=engine.capabilities.model_tier,
         )
@@ -147,7 +157,10 @@ def select_engine(
             "requested": requested,
             "candidates": candidates,
             "reasons": reasons,
-            "hint": "安装 mediapipe，或把 RTMPose/RTMO 的 ONNX 权重放入 models/ 目录",
+            "hint": (
+                "检查 models/ 下的姿态模型：ONNX 需自行下载 rtmpose*.onnx / rtmo*.onnx；"
+                "MediaPipe 可在侧栏“模型”卡片下载所需档位的 pose_landmarker_*.task"
+            ),
         },
     )
 

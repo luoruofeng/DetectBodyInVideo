@@ -55,6 +55,13 @@ class AngleConfig(BaseModel):
         True, description="优先用米制 world landmarks（尺度无关，更稳）；缺失时自动退回归一化坐标"
     )
     min_visibility: float = Field(0.3, ge=0, lt=1)
+    hold_occluded_frames: int = Field(
+        15,
+        ge=0,
+        le=120,
+        description="关节被遮挡导致角度不可计算时，最多沿用多少帧上一次有效角度；"
+        "只为短时遮挡提供连续读数，超过上限继续返回缺失（0 = 关闭）",
+    )
     round_digits: int = Field(2, ge=0, le=4)
 
 
@@ -148,12 +155,32 @@ def compute_angles(
 def attach_angles(
     frames: Sequence[PoseFrame], config: AngleConfig | None = None
 ) -> list[dict[str, float]]:
-    """按帧顺序输出角度序列；无效帧返回空字典。"""
+    """按帧顺序输出角度序列；无效帧返回空字典。
+
+    短时遮挡（关键点可见度不足）造成角度缺失时沿用上一有效读数，避免曲线突然
+    断成空洞；连续遮挡超过 ``hold_occluded_frames`` 后仍然返回缺失，不长期伪造。
+    """
     config = config or AngleConfig()
-    return [
-        compute_angles(frame, config) if frame.valid else {}
-        for frame in sorted(frames, key=lambda item: item.index)
-    ]
+    results: list[dict[str, float]] = []
+    last: dict[str, tuple[float, int]] = {}
+    for frame in sorted(frames, key=lambda item: item.index):
+        if not frame.valid:
+            results.append({})
+            continue
+        current = compute_angles(frame, config)
+        held = dict(current)
+        updated: dict[str, tuple[float, int]] = {}
+        for name in set(last) | set(current):
+            if name in current:
+                updated[name] = (current[name], 0)
+                continue
+            value, age = last[name]
+            if config.hold_occluded_frames and age < config.hold_occluded_frames:
+                held[name] = value
+                updated[name] = (value, age + 1)
+        last = updated
+        results.append(held)
+    return results
 
 
 def angle_series(frames: Sequence[PoseFrame], name: str, config: AngleConfig | None = None) -> list[float | None]:

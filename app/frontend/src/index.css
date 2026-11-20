@@ -116,6 +116,24 @@
     color: #94a3b8;
   }
 
+  [data-theme='light'] .on-video .text-slate-100,
+  [data-theme='light'] .on-video .text-slate-200 {
+    color: #e2e8f0;
+  }
+
+  [data-theme='light'] .on-video .text-slate-300 {
+    color: #cbd5e1;
+  }
+
+  [data-theme='light'] .on-video .text-slate-400,
+  [data-theme='light'] .on-video .text-slate-500 {
+    color: #94a3b8;
+  }
+
+  [data-theme='light'] .on-video .text-slate-600 {
+    color: #7c8ba1;
+  }
+
   [data-theme='light'] ::-webkit-scrollbar-thumb {
     background-color: rgb(15 23 42 / 0.18);
   }
@@ -183,6 +201,11 @@
 
   .skeleton-block {
     @apply animate-pulse-soft rounded bg-white/[0.06];
+  }
+
+  /* 右侧栏独立滚动：细滚动条（Firefox / Chromium 121+） */
+  .panel-scroll {
+    scrollbar-width: thin;
   }
 
   .tab {

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import type { CSSProperties } from 'react'
 
 import type { AnalysisOptions, PreviewFrame } from '../api/analysis'
 import type { HardwareReport } from '../api/hardware'
@@ -77,6 +78,9 @@ function StepsCard() {
 }
 
 interface SidePanelProps {
+  /** 右侧栏宽度（px），仅 lg 及以上生效；窄屏仍是整列铺满 */
+  width: number
+  resizing?: boolean
   health: HealthInfo | null
   apiStatus: ApiStatus
   hardware: HardwareReport | null
@@ -93,6 +97,8 @@ interface SidePanelProps {
 }
 
 export function SidePanel({
+  width,
+  resizing = false,
   health,
   apiStatus,
   hardware,
@@ -110,8 +116,13 @@ export function SidePanel({
   const [showGrid, setShowGrid] = useState(true)
 
   return (
-    <aside className="flex w-full shrink-0 flex-col gap-3 overflow-y-auto pb-1 lg:w-[340px] xl:w-[380px]">
-      <ModelCard models={models} />
+    <aside
+      className={`panel-scroll flex w-full min-w-0 shrink-0 flex-col gap-3 overflow-y-auto overscroll-contain pb-1 lg:w-[var(--side-panel-width)] ${
+        resizing ? 'lg:select-none' : ''
+      }`}
+      style={{ '--side-panel-width': `${width}px` } as CSSProperties}
+    >
+      <ModelCard models={models} recommendedTier={hardware?.acceleration.model_tier} />
       <ShootingGuideCard />
       {video ? <AnalysisPanel video={video} analysis={analysis} disabled={false} onStart={onStart} /> : null}
       {video ? <ExportCard analysis={analysis} /> : null}

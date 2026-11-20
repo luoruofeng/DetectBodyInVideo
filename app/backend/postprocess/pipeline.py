@@ -96,6 +96,8 @@ def legacy_postprocess_config() -> PostProcessConfig:
       骨长回到"所有帧等权中位数、左右独立"，不再筛正对帧、不强制对称；
     - ``estimate_orientation=False``：不算 yaw、也不给拟合 yaw 先验；
     - ``hand_stability.enabled=False``：手部 21 点原样透传，不做补帧/迟滞/平滑；
+    - ``ik_fit.hold_occluded_limbs=False`` / ``angles.hold_occluded_frames=0``：
+      关闭遮挡肢体的相对角度保持和角度读数保持；
     - ``quality.enable_depth_gate=False`` / ``enable_framing_rules=False``：质检不因新指标降级。
 
     新增的字段（depthConfidence 等）仍会输出，但都是附加信息，不改变可用数值。
@@ -108,11 +110,13 @@ def legacy_postprocess_config() -> PostProcessConfig:
             extra_world_pass=False,
         ),
         hand_stability=HandStabilityConfig(enabled=False),
+        angles=AngleConfig(hold_occluded_frames=0),
         ik_fit=FitConfig(
             depth_prior_weight=0.05,
             temporal_axes="xyz",
             bone_sample_min_projected_ratio=0.0,
             symmetrize_bones=False,
+            hold_occluded_limbs=False,
         ),
         estimate_orientation=False,
         quality=QualityConfig(enable_depth_gate=False, enable_framing_rules=False),

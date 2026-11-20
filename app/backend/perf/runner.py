@@ -291,6 +291,8 @@ def run_inference(
 
     emit("开始解码")
     producer.start()
+    # 断点续算：先把手上已有的帧交给预览，旧关键点不用等到新帧算出来才可见。
+    publish_preview()
     try:
         batch: list[FramePacket] = []
         finished = False
@@ -349,7 +351,8 @@ def run_inference(
         if checkpoint is not None:
             checkpoint.flush()
         if cancelled():
-            # 取消：保留断点文件，方便下次续算；引擎由上层 close()
+            # 取消：把最后一批帧也交给预览，再保留断点文件方便下次续算；引擎由上层 close()
+            publish_preview()
             if checkpoint is not None:
                 checkpoint.close()
             raise AnalysisCancelledError("分析已被取消")

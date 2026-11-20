@@ -12,7 +12,7 @@ const SUPPORTED_FORMATS = ['MP4', 'MOV', 'AVI', 'MKV', 'H.264 / H.265']
 
 function EmptyState({ onPick }: { onPick: () => void }) {
   return (
-    <div className="flex max-w-lg flex-col items-center gap-5 px-6 text-center">
+    <div className="on-video flex max-w-lg flex-col items-center gap-5 px-6 text-center">
       <div className="relative grid h-20 w-20 place-items-center rounded-2xl bg-gradient-to-br from-accent/20 to-transparent ring-1 ring-inset ring-accent/25">
         <FilmIcon className="h-8 w-8 text-accent" />
       </div>
@@ -142,7 +142,7 @@ export function VideoStage({
       {busy ? <ProgressState phase={phase} progress={progress} /> : null}
 
       {!busy && error ? (
-        <div className="flex max-w-md flex-col items-center gap-3 px-6 text-center">
+        <div className="on-video flex max-w-md flex-col items-center gap-3 px-6 text-center">
           <div className="grid h-12 w-12 place-items-center rounded-2xl border border-danger/30 bg-danger/10">
             <AlertIcon className="h-5 w-5 text-danger" />
           </div>
