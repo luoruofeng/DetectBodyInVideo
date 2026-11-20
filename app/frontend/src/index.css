@@ -1,0 +1,196 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 主题令牌：深色为默认，浅色由 data-theme='light' 覆盖（任务 8.1） */
+:root {
+  color-scheme: dark;
+  --surface-canvas: 11 15 20;
+  --surface-panel: 17 24 32;
+  --surface-elevated: 22 31 41;
+  --surface-line: 255 255 255;
+  --line-alpha: 0.08;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  --surface-canvas: 244 247 250;
+  --surface-panel: 255 255 255;
+  --surface-elevated: 241 245 249;
+  --surface-line: 15 23 42;
+  --line-alpha: 0.1;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas font-sans text-sm text-slate-300 antialiased;
+    transition: background-color 180ms ease, color 180ms ease;
+  }
+
+  ::selection {
+    @apply bg-accent/30 text-slate-100;
+  }
+
+  :focus-visible {
+    outline: 2px solid theme('colors.accent.DEFAULT');
+    outline-offset: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full border-2 border-solid border-canvas bg-white/10;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-white/20;
+  }
+
+  /* 浅色主题下的文本 / 描边微调（组件保留同一套 class） */
+  [data-theme='light'] body {
+    color: #334155;
+  }
+
+  [data-theme='light'] .text-slate-100,
+  [data-theme='light'] .text-slate-200 {
+    color: #0f172a;
+  }
+
+  [data-theme='light'] .text-slate-300 {
+    color: #334155;
+  }
+
+  [data-theme='light'] .text-slate-400 {
+    color: #475569;
+  }
+
+  [data-theme='light'] .text-slate-500 {
+    color: #5b6b80;
+  }
+
+  [data-theme='light'] .text-slate-600 {
+    color: #94a3b8;
+  }
+
+  [data-theme='light'] .bg-white\/\[0\.03\],
+  [data-theme='light'] .bg-white\/\[0\.04\] {
+    background-color: rgb(15 23 42 / 0.04);
+  }
+
+  [data-theme='light'] .bg-white\/\[0\.06\] {
+    background-color: rgb(15 23 42 / 0.07);
+  }
+
+  [data-theme='light'] .hover\:bg-white\/5:hover {
+    background-color: rgb(15 23 42 / 0.06);
+  }
+
+  [data-theme='light'] .bg-white\/10 {
+    background-color: rgb(15 23 42 / 0.12);
+  }
+
+  [data-theme='light'] .btn-primary:disabled {
+    background-color: rgb(15 23 42 / 0.06);
+    color: #64748b;
+  }
+
+  /* 视频上方的深色遮罩内保持亮色文字，不参与浅色主题的文本反转 */
+  .on-video {
+    color: #e2e8f0;
+  }
+
+  .on-video-dim {
+    color: #94a3b8;
+  }
+
+  [data-theme='light'] ::-webkit-scrollbar-thumb {
+    background-color: rgb(15 23 42 / 0.18);
+  }
+
+  [data-theme='light'] .shadow-panel {
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 16px 32px -28px rgb(15 23 42 / 0.4);
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-line bg-panel/80 shadow-panel;
+  }
+
+  .card-title {
+    @apply flex items-center justify-between gap-2 border-b border-line px-4 py-3 text-xs font-medium uppercase tracking-wider text-slate-400;
+  }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-xl px-3.5 py-2 text-sm font-medium transition
+      focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-slate-950 hover:bg-accent-strong hover:shadow-glow active:scale-[0.99];
+  }
+
+  .btn-primary:disabled {
+    @apply bg-white/[0.06] text-slate-500 shadow-none;
+  }
+
+  .btn-ghost {
+    @apply btn border border-line bg-white/[0.03] text-slate-300 hover:border-white/15 hover:bg-white/[0.06] hover:text-white;
+  }
+
+  .btn-icon {
+    @apply inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-line bg-white/[0.03] text-slate-300 transition
+      hover:border-white/15 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-2xs font-medium;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-line bg-elevated/80 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500
+      transition focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:opacity-50;
+  }
+
+  .label {
+    @apply text-xs font-medium text-slate-400;
+  }
+
+  .kv {
+    @apply flex items-baseline justify-between gap-3 py-1 text-xs;
+  }
+
+  .kv-key {
+    @apply shrink-0 text-slate-500;
+  }
+
+  .kv-value {
+    @apply truncate text-right font-mono text-slate-300;
+  }
+
+  .skeleton-block {
+    @apply animate-pulse-soft rounded bg-white/[0.06];
+  }
+
+  .tab {
+    @apply rounded-lg px-3 py-1.5 text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-slate-200
+      focus-visible:outline-none;
+  }
+
+  .tab-active {
+    @apply bg-accent/10 text-accent ring-1 ring-inset ring-accent/30;
+  }
+}

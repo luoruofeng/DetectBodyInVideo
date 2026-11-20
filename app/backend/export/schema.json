@@ -1,0 +1,495 @@
+{
+  "$defs": {
+    "ExportFrame": {
+      "additionalProperties": false,
+      "description": "一帧姿态。``t`` 为相对视频起点的秒数。",
+      "properties": {
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "t": {
+          "minimum": 0,
+          "title": "T",
+          "type": "number"
+        },
+        "valid": {
+          "default": true,
+          "title": "Valid",
+          "type": "boolean"
+        },
+        "interpolated": {
+          "default": false,
+          "title": "Interpolated",
+          "type": "boolean"
+        },
+        "joints": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JointOut"
+          },
+          "description": "髋中心相对坐标，单位米、Y 向上；不是相对各自父关节的局部坐标",
+          "title": "Joints",
+          "type": "object"
+        },
+        "angles": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Angles",
+          "type": "object"
+        },
+        "rawLandmarks": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JointOut"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "原始归一化 33 点，不是米：x/y 相对图像宽/高，y 向下，z 为髋相对深度且与 x 同尺度",
+          "title": "Rawlandmarks"
+        }
+      },
+      "required": [
+        "index",
+        "t"
+      ],
+      "title": "ExportFrame",
+      "type": "object"
+    },
+    "JointOut": {
+      "additionalProperties": false,
+      "description": "关节点 + 置信度；joints 使用米，rawLandmarks 使用原始归一化坐标。",
+      "properties": {
+        "x": {
+          "default": 0.0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "default": 0.0,
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "default": 0.0,
+          "title": "Z",
+          "type": "number"
+        },
+        "visibility": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Visibility",
+          "type": "number"
+        }
+      },
+      "title": "JointOut",
+      "type": "object"
+    },
+    "QualityOut": {
+      "additionalProperties": false,
+      "description": "数据质检报告，与 ``qualityReport.verdict`` 一起决定\"能用 / 建议重录\"。",
+      "properties": {
+        "framesTotal": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Framestotal",
+          "type": "integer"
+        },
+        "framesValid": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Framesvalid",
+          "type": "integer"
+        },
+        "validFrameRatio": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Validframeratio",
+          "type": "number"
+        },
+        "interpolatedFrames": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Interpolatedframes",
+          "type": "integer"
+        },
+        "meanVisibility": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Meanvisibility",
+          "type": "number"
+        },
+        "meanScore": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Meanscore",
+          "type": "number"
+        },
+        "maxJump": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Maxjump",
+          "type": "number"
+        },
+        "maxJumpFrame": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxjumpframe"
+        },
+        "zJitterRms": {
+          "default": 0.0,
+          "description": "相邻帧 z 的 RMS（米）",
+          "minimum": 0,
+          "title": "Zjitterrms",
+          "type": "number"
+        },
+        "boneLengthCv": {
+          "default": 0.0,
+          "description": "骨长变异系数最大值（0~1）",
+          "minimum": 0,
+          "title": "Bonelengthcv",
+          "type": "number"
+        },
+        "meanReprojError": {
+          "default": 0.0,
+          "description": "3D 反投影与 2D 的平均误差（归一化）",
+          "minimum": 0,
+          "title": "Meanreprojerror",
+          "type": "number"
+        },
+        "depthConfidence": {
+          "default": 0.0,
+          "description": "深度可信度 0~1",
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Depthconfidence",
+          "type": "number"
+        },
+        "verdict": {
+          "default": "rerecord",
+          "enum": [
+            "ready",
+            "review",
+            "rerecord"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        },
+        "verdictLabel": {
+          "default": "",
+          "title": "Verdictlabel",
+          "type": "string"
+        },
+        "issues": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Issues",
+          "type": "array"
+        },
+        "smoothing": {
+          "additionalProperties": true,
+          "title": "Smoothing",
+          "type": "object"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Notes",
+          "type": "array"
+        }
+      },
+      "title": "QualityOut",
+      "type": "object"
+    },
+    "Quaternion": {
+      "properties": {
+        "x": {
+          "default": 0.0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "default": 0.0,
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "default": 0.0,
+          "title": "Z",
+          "type": "number"
+        },
+        "w": {
+          "default": 1.0,
+          "title": "W",
+          "type": "number"
+        }
+      },
+      "title": "Quaternion",
+      "type": "object"
+    },
+    "RootMotionFrameOut": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "t": {
+          "minimum": 0,
+          "title": "T",
+          "type": "number"
+        },
+        "translation": {
+          "$ref": "#/$defs/Vector3"
+        },
+        "rotation": {
+          "$ref": "#/$defs/Quaternion"
+        }
+      },
+      "required": [
+        "index",
+        "t"
+      ],
+      "title": "RootMotionFrameOut",
+      "type": "object"
+    },
+    "RootMotionOut": {
+      "additionalProperties": false,
+      "description": "根运动（任务 6.3）：位移挂 root 节点，旋转挂髋节点。",
+      "properties": {
+        "mode": {
+          "default": "world",
+          "enum": [
+            "world",
+            "in_place"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "totalTranslation": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Totaltranslation",
+          "type": "number"
+        },
+        "convention": {
+          "default": "",
+          "title": "Convention",
+          "type": "string"
+        },
+        "frames": {
+          "items": {
+            "$ref": "#/$defs/RootMotionFrameOut"
+          },
+          "title": "Frames",
+          "type": "array"
+        }
+      },
+      "title": "RootMotionOut",
+      "type": "object"
+    },
+    "SourceInfo": {
+      "additionalProperties": false,
+      "description": "源视频元信息，iOS 侧据此做时间轴与画幅对齐。",
+      "properties": {
+        "file": {
+          "description": "源文件名（不含目录）",
+          "minLength": 1,
+          "title": "File",
+          "type": "string"
+        },
+        "fps": {
+          "exclusiveMinimum": 0,
+          "title": "Fps",
+          "type": "number"
+        },
+        "width": {
+          "description": "纠正旋转后的显示宽度",
+          "exclusiveMinimum": 0,
+          "title": "Width",
+          "type": "integer"
+        },
+        "height": {
+          "exclusiveMinimum": 0,
+          "title": "Height",
+          "type": "integer"
+        },
+        "frames": {
+          "description": "源视频总帧数",
+          "minimum": 0,
+          "title": "Frames",
+          "type": "integer"
+        },
+        "durationSeconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Durationseconds"
+        }
+      },
+      "required": [
+        "file",
+        "fps",
+        "width",
+        "height",
+        "frames"
+      ],
+      "title": "SourceInfo",
+      "type": "object"
+    },
+    "Vector3": {
+      "properties": {
+        "x": {
+          "default": 0.0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "default": 0.0,
+          "title": "Y",
+          "type": "number"
+        },
+        "z": {
+          "default": 0.0,
+          "title": "Z",
+          "type": "number"
+        }
+      },
+      "title": "Vector3",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "完整导出文档 = 附录 A 的正式定义。",
+  "properties": {
+    "version": {
+      "default": "1.1.0",
+      "title": "Version",
+      "type": "string"
+    },
+    "generator": {
+      "default": "DetectBodyInVideo 0.1.0",
+      "title": "Generator",
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceInfo"
+    },
+    "coordinateSystem": {
+      "default": "arkit-right-handed-y-up",
+      "title": "Coordinatesystem",
+      "type": "string"
+    },
+    "units": {
+      "default": "meters",
+      "title": "Units",
+      "type": "string"
+    },
+    "depthIsEstimated": {
+      "default": true,
+      "description": "恒为 true：z（前后方向）是单目估计值，绝对深度与前后位移不可信",
+      "title": "Depthisestimated",
+      "type": "boolean"
+    },
+    "depthConfidence": {
+      "default": 0.0,
+      "description": "整段视频的深度可信度 0~1；与 quality.depthConfidence 同值，方便消费方只读顶层",
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Depthconfidence",
+      "type": "number"
+    },
+    "warnings": {
+      "description": "导出时的可信度提示（中文），消费方应展示给用户",
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
+    },
+    "personHeightMeters": {
+      "default": 1.7,
+      "description": "系统从世界坐标自动测量的参考高度（头中心→脚底，米），比真实身高偏小约 10%；仅作缩放核对，不参与骨骼坐标计算",
+      "exclusiveMinimum": 0.5,
+      "maximum": 2.5,
+      "title": "Personheightmeters",
+      "type": "number"
+    },
+    "jointNames": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Jointnames",
+      "type": "array"
+    },
+    "frames": {
+      "items": {
+        "$ref": "#/$defs/ExportFrame"
+      },
+      "title": "Frames",
+      "type": "array"
+    },
+    "quality": {
+      "$ref": "#/$defs/QualityOut"
+    },
+    "rootMotion": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RootMotionOut"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Notes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "source",
+    "jointNames"
+  ],
+  "title": "DetectBodyInVideo Pose Export",
+  "type": "object",
+  "$id": "https://detect-body.local/schema/pose-export-1.1.0.json",
+  "x-schema-version": "1.1.0",
+  "x-coordinate-system": "arkit-right-handed-y-up",
+  "x-units": "meters",
+  "x-depth-is-estimated": true,
+  "x-generated-by": "DetectBodyInVideo 0.1.0"
+}

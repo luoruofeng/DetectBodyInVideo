@@ -7,20 +7,22 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+#   注意：以下目录名一律用 / 锚定到仓库根，否则会误伤源码目录。
+#   例如不锚定 lib/ 会把 app/frontend/src/lib/ 下的 TypeScript 源码全部忽略。
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -31,6 +33,8 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# 但本仓库手工维护的打包脚本模板必须入库（scripts/package.* 依赖它）
+!packaging/*.spec
 
 # Installer logs
 pip-log.txt
@@ -221,3 +225,128 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# 模型权重 / 预训练资产（体积巨大，绝不入库）
+#   models/ 由 scripts/bootstrap.ps1 或界面「模型下载」写入，
+#   克隆仓库后重新下载即可（目录里的 .gitkeep 保留，用于占住空目录）。
+# ---------------------------------------------------------------------------
+models/*
+!models/.gitkeep
+
+# 下载中的临时分片（先写 .part 再原子替换）
+*.part
+*.download
+*.tmp
+
+# 常见推理 / 训练权重后缀
+#   .task / .tflite  MediaPipe Tasks
+#   .onnx / .ort      ONNX Runtime（RTMPose / RTMO）
+#   .pt / .pth / .ckpt / .safetensors  PyTorch
+#   .engine / .trt / .plan  TensorRT
+#   .pb / .h5 / .keras / .pdmodel / .pdiparams  TensorFlow / Paddle
+*.task
+*.tflite
+*.onnx
+*.ort
+*.engine
+*.trt
+*.plan
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.pb
+*.h5
+*.keras
+*.pdmodel
+*.pdiparams
+*.mlmodel
+*.mlpackage
+
+# 运行时数据目录（若被配置到仓库内）
+.detect-body/
+
+# 深度精度基准脚本的输出（本次/历史指标 JSON）
+/out/
+
+# 深度基准素材本体：体积大，只提交 samples/benchmark/README.md 里的说明
+samples/*.mp4
+samples/*.mov
+samples/*.m4v
+
+# ---------------------------------------------------------------------------
+# 本地参考素材（体积巨大 / 受第三方许可约束，绝不入库）
+#   resources/AppleModel.usda      苹果 App 使用的骨骼参考模型（91 个 ARKit 关节，
+#                                  动作 JSON 的骨长比例与关节命名都来自它）
+#   resources/demo.mp4             软件测试用视频（1080×1188，约 12.5 分钟）
+#   resources/air-squat-motion.json iOS App 的动作 JSON 样例（格式参考）
+#   克隆仓库后需自行把这些文件放回 resources/。
+# ---------------------------------------------------------------------------
+resources/
+
+# ---------------------------------------------------------------------------
+# 前端（app/frontend）
+#   node_modules/   npm 下载的依赖，用 `npm ci` 可完整还原（package-lock.json 已入库）
+#   ../backend/static   vite build 的产物（vite.config.ts 的 outDir），由
+#                       `npm run build` 重新生成，绝不入库
+# ---------------------------------------------------------------------------
+node_modules/
+app/frontend/dist/
+app/frontend/.vite/
+app/backend/static/
+*.tsbuildinfo
+.eslintcache
+.vite/
+
+# 其它包管理器的缓存 / 虚拟存储
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.yarn/versions/
+.bun/
+
+# 包管理器本地日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------------------------
+# 打包 / 构建产物与临时日志
+# ---------------------------------------------------------------------------
+/logs/
+*.bak
+*.orig
+*.rej
+*~
+run_server.out.log
+run_server.err.log
+
+# ---------------------------------------------------------------------------
+# 编译型二进制（打包产物，非源码）
+#   注意 *.so 已在文件开头忽略，这里补齐其它平台的扩展模块与可执行文件
+# ---------------------------------------------------------------------------
+*.pyd
+*.dylib
+*.dll
+*.exe
+*.msi
+*.dmg
+*.app/
+
+# ---------------------------------------------------------------------------
+# 操作系统 / 编辑器垃圾文件
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.idea/
+*.swp
+*.swo
