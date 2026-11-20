@@ -53,15 +53,30 @@ interface SceneRefs {
 // 56 的分辨率会让手臂和躯干糊成一团；96 才能在 1.9 m 身高内画出可辨认的人形轮廓。
 const RESOLUTION = 96
 const MAX_POLY_COUNT = 200_000
-// subtract 越大，metaball 的融合半径越小，相邻肢体不会黏成白色土豆。
-const ISOLATION = 90
-const SUBTRACT = 42
 const SMOOTHING = 0.55
 // 逐帧重建隐式曲面的上限频率，避免播放时把主线程占满。
 const BUILD_INTERVAL_MS = 45
 
+// 自定义标量场：单球在 d²=1 处取到 1，等值面 1 正好对应球的标称半径。
+// 重叠球用“平滑取大”而不是线性相加——否则胸口的六七个球会把躯干吹成粗圆柱，
+// 手臂也被膨胀的侧壁吞进去。平滑取大只让接缝融合，不会放大整体轮廓。
+const FIELD_ISOLATION = 1
+const FIELD_FALLOFF = 2.2
+const FIELD_CUTOFF = 2.6
+const FIELD_CUTOFF_RADIUS = Math.sqrt(FIELD_CUTOFF)
+const FIELD_BLEND = 0.28
+const FIELD_BLEND_FLOOR = FIELD_ISOLATION * 0.25
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
+}
+
+function smoothUnion(a: number, b: number): number {
+  const high = Math.max(a, b)
+  const low = Math.min(a, b)
+  if (low < FIELD_BLEND_FLOOR || high - low >= FIELD_BLEND) return high
+  const h = FIELD_BLEND - (high - low)
+  return high + (h * h) / (4 * FIELD_BLEND)
 }
 
 function addFieldBall(
@@ -71,19 +86,54 @@ function addFieldBall(
   colorHex: number,
   colors: Map<number, THREE.Color>,
 ): void {
-  const ballX = clamp(0.5 + point.x / 2, 0.02, 0.98)
-  const ballY = clamp(0.5 + point.y / 2, 0.02, 0.98)
-  const ballZ = clamp(0.5 + point.z / 2, 0.02, 0.98)
-  // MarchingCubes 的 field 坐标是 [-1,1]，而 addBall 使用 [0,1]。
-  const normalizedRadius = clamp(radius / 2, 0.01, 0.2)
-  const strength = normalizedRadius * normalizedRadius * (ISOLATION + SUBTRACT)
+  if (![point.x, point.y, point.z, radius].every(Number.isFinite) || radius <= 0) return
+
+  const field = surface.field
+  const palette = surface.palette
+  const size = surface.size
+  const invRadiusSquared = 4 / (radius * radius)
+  // MarchingCubes 的 field 坐标是 [-1,1]，而球的输入半径是世界米数（对应 [-0.5,0.5]）。
+  const extent = (radius / 2) * FIELD_CUTOFF_RADIUS
+  const minX = clamp(Math.floor((point.x - extent + 1) * size * 0.5), 0, size - 1)
+  const maxX = clamp(Math.ceil((point.x + extent + 1) * size * 0.5), 0, size - 1)
+  const minY = clamp(Math.floor((point.y - extent + 1) * size * 0.5), 0, size - 1)
+  const maxY = clamp(Math.ceil((point.y + extent + 1) * size * 0.5), 0, size - 1)
+  const minZ = clamp(Math.floor((point.z - extent + 1) * size * 0.5), 0, size - 1)
+  const maxZ = clamp(Math.ceil((point.z + extent + 1) * size * 0.5), 0, size - 1)
 
   let color = colors.get(colorHex)
   if (!color) {
     color = new THREE.Color(colorHex)
     colors.set(colorHex, color)
   }
-  surface.addBall(ballX, ballY, ballZ, strength, SUBTRACT, color)
+  const red = Math.min(1, color.r)
+  const green = Math.min(1, color.g)
+  const blue = Math.min(1, color.b)
+
+  for (let z = minZ; z <= maxZ; z += 1) {
+    const dz = (z * 2) / size - 1 - point.z
+    for (let y = minY; y <= maxY; y += 1) {
+      const dy = (y * 2) / size - 1 - point.y
+      for (let x = minX; x <= maxX; x += 1) {
+        const dx = (x * 2) / size - 1 - point.x
+        const distanceSquared = (dx * dx + dy * dy + dz * dz) * invRadiusSquared
+        if (distanceSquared >= FIELD_CUTOFF) continue
+
+        const value = Math.exp(FIELD_FALLOFF * (1 - distanceSquared))
+        const index = (z * size + y) * size + x
+        const previous = field[index]
+        const next = smoothUnion(previous, value)
+        if (next <= previous) continue
+
+        field[index] = next
+        const weight = clamp(value / FIELD_ISOLATION, 0, 1)
+        const paletteIndex = index * 3
+        palette[paletteIndex] = red * weight
+        palette[paletteIndex + 1] = green * weight
+        palette[paletteIndex + 2] = blue * weight
+      }
+    }
+  }
 }
 
 function rebuildSurface(surface: MarchingCubes, joints: JointMap): void {
@@ -211,7 +261,7 @@ export function ThreeMeshPreview({ frame, showGrid, theme }: ThreeMeshPreviewPro
       side: THREE.DoubleSide,
     })
     const surface = new MarchingCubes(RESOLUTION, material, false, true, MAX_POLY_COUNT)
-    surface.isolation = ISOLATION
+    surface.isolation = FIELD_ISOLATION
     surface.frustumCulled = false
     surface.visible = false
 

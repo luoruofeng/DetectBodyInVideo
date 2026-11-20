@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     首次运行准备：建 venv、装 Python/前端依赖、下载 MediaPipe 姿态模型。
 .EXAMPLE

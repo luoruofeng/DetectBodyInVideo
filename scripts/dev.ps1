@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     一键启动开发环境：后端 uvicorn（热重载）+ 前端 vite。
 .EXAMPLE
