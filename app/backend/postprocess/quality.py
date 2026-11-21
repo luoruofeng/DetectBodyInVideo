@@ -36,10 +36,16 @@ from app.backend.engine.base import (
     RIGHT_WRIST,
     PoseFrame,
 )
+from app.backend.postprocess.depth_sign import DepthSignReport
 from app.backend.postprocess.gaps import GapFillReport
-from app.backend.postprocess.ik_fit import FitReport, bone_length_cv
+from app.backend.postprocess.ik_fit import (
+    FitReport,
+    bone_length_cv,
+    estimate_image_scale,
+    node_positions,
+)
 from app.backend.postprocess.smoothing import SmoothingInfo
-from app.backend.skeleton.topology import JITTER_GROUPS
+from app.backend.skeleton.topology import BONE_SEGMENTS, JITTER_GROUPS, node_map
 
 logger = get_logger("postprocess.quality")
 
@@ -119,6 +125,24 @@ class QualityConfig(BaseModel):
     )
     enable_framing_rules: bool = Field(
         True, description="是否启用拍摄质量规则（机位/距离/走近）；关闭后不追加这些 issues"
+    )
+    # ---- 矢状面运动提示（深度方向歧义的"事前"提示）----
+    enable_sagittal_hint: bool = Field(
+        True,
+        description="四肢长时间沿视线方向运动时提示补拍侧视机位。"
+        "这类动作在正面机位下前后方向本来就没有观测，后处理只能猜，属于拍摄问题",
+    )
+    sagittal_projected_ratio: float = Field(
+        0.5,
+        gt=0,
+        le=1,
+        description="骨段投影比低于该值即视为「指向/远离镜头」，前后方向不可观测",
+    )
+    sagittal_min_frame_share: float = Field(
+        0.25,
+        gt=0,
+        le=1,
+        description="至少这么多比例的帧出现上述情况才提示；偶尔一次的伸展不该报警",
     )
 
 
@@ -226,6 +250,73 @@ def _max_bone_cv(frames: Sequence[PoseFrame]) -> float:
     return float(max(cv.values())) if cv else 0.0
 
 
+# 只统计四肢长骨：前踢腿/前伸胳膊这类"指向镜头"的动作就是在这些骨段上发生的
+LIMB_SEGMENT_KEYS: tuple[str, ...] = (
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+
+
+def sagittal_motion_share(
+    frames: Sequence[PoseFrame],
+    *,
+    aspect: float = 9 / 16.0,
+    threshold: float = 0.5,
+) -> float:
+    """四肢骨段"沿视线方向"的帧占比（0~1）。
+
+    判据：``2D 投影长度 / (k * 观测骨长) < threshold``。比例越小说明这条骨段越顺着
+    镜头方向躺着 —— 此时 2D 已经把 ``|Δz|`` 定死，只剩符号（前面还是后面）没有观测。
+    这是"前踢腿被解成后踢腿"这类问题的**拍摄期**根因，比事后调参更能解决问题。
+    """
+    if not frames:
+        return 0.0
+    nodes = node_map()
+    hit = 0
+    counted = 0
+    for frame in sorted(frames, key=lambda item: item.index):
+        if not frame.valid or len(frame.world_landmarks) < LANDMARK_COUNT:
+            continue
+        positions = node_positions(frame.world_landmarks)
+        if not positions:
+            continue
+        scale, _, _ = estimate_image_scale(frame, aspect)
+        if scale <= 1e-9:
+            continue
+        counted += 1
+        for node in BONE_SEGMENTS:
+            if node.key not in LIMB_SEGMENT_KEYS or node.index is None:
+                continue
+            parent = positions.get(node.parent or "")
+            child = positions.get(node.key)
+            if parent is None or child is None:
+                continue
+            length = float(np.linalg.norm(child - parent))
+            expected = scale * length
+            if expected <= 1e-9:
+                continue
+            # 投影长度必须用 **2D** 观测算（u = x*aspect），不能用世界点的 x/y：
+            # 后者本身就是米制，除以 k·L 之后恒等于 1，判据会永远不触发。
+            point = frame.landmarks[node.index]
+            parent_node = nodes.get(node.parent or "")
+            if parent_node is None or parent_node.index is None:
+                continue
+            anchor = frame.landmarks[parent_node.index]
+            projected = math.hypot(
+                (point.x - anchor.x) * aspect, point.y - anchor.y
+            )
+            if projected / expected < threshold:
+                hit += 1
+                break
+    return hit / counted if counted else 0.0
+
+
 # 头顶用脸部点（0~10 里最小的 y），脚底用两踝中点；米制缺省值用于没有世界坐标的引擎
 FACE_INDICES = tuple(range(11))
 DEFAULT_HEAD_WIDTH = 0.15
@@ -331,6 +422,8 @@ def build_quality_report(
     smoothing: SmoothingInfo | None = None,
     gaps: GapFillReport | None = None,
     fit: FitReport | None = None,
+    depth_sign: DepthSignReport | None = None,
+    aspect: float | None = None,
 ) -> QualityReport:
     config = config or QualityConfig()
     ordered = sorted(frames, key=lambda item: item.index)
@@ -429,6 +522,18 @@ def build_quality_report(
                 f"人物框面积每帧变化 {framing.area_change_per_frame:.1%}：正在快速走近/远离镜头，"
                 "前后（深度）位移不可信；建议横向移动或保持距离固定"
             )
+        if config.enable_sagittal_hint:
+            share = sagittal_motion_share(
+                valid_frames,
+                aspect=aspect or 9 / 16.0,
+                threshold=config.sagittal_projected_ratio,
+            )
+            if share >= config.sagittal_min_frame_share:
+                issues.append(
+                    f"约 {share:.0%} 的帧里四肢顺（或逆）着镜头方向伸展，"
+                    "前后方向只有符号没有观测：这类动作（如向前踢腿）从正面拍必然存在"
+                    "「朝前来还是朝后去」的二义性；建议补拍一个正侧机位"
+                )
 
     notes: list[str] = []
     if gaps is not None and gaps.frames_filled:
@@ -448,6 +553,8 @@ def build_quality_report(
             f"重投影 {fit.reproj_error_norm:.4f}（归一化坐标），{fit.milliseconds_per_frame:.1f} ms/帧"
             + rigid
         )
+    if depth_sign is not None and depth_sign.notes and depth_sign.mode != "off":
+        notes.extend(depth_sign.notes)
     notes.append(
         f"深度可信度 {confidence:.2f}（z 抖动 {z_jitter * 100:.2f} cm、骨长波动 {bone_cv:.2%}、"
         f"重投影 {reproj:.4f}）；x/y 来自 2D 检测，可信；z 仅为单目估计值"

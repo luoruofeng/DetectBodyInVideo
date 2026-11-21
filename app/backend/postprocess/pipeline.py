@@ -2,7 +2,7 @@
 
 顺序（改动后）：
 选目标 track → 补连续帧 → 标记无效帧 → 补短缺口 → 平滑 → **手部时序稳定** →
-固定骨长 IK 拟合 → 算角度 → 质检。
+骨长标定 → yaw 估计 → **深度符号先验** → 固定骨长 IK 拟合 → 算角度 → 质检。
 
 三个关键约定：
 - 平滑只作用在有效帧上，避免空占位帧的 0 值把轨迹拉回原点；
@@ -28,6 +28,11 @@ from app.backend.engine.tracking import (
     summarize_tracks,
 )
 from app.backend.postprocess.angles import AngleConfig, attach_angles
+from app.backend.postprocess.depth_sign import (
+    DepthSignConfig,
+    DepthSignReport,
+    estimate_depth_signs,
+)
 from app.backend.postprocess.gaps import GapFillConfig, GapFillReport, densify, process_gaps
 from app.backend.postprocess.hands import (
     HandStabilityConfig,
@@ -71,6 +76,10 @@ class PostProcessConfig(BaseModel):
     angles: AngleConfig = Field(default_factory=AngleConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     ik_fit: FitConfig = Field(default_factory=FitConfig)
+    depth_sign: DepthSignConfig = Field(
+        default_factory=DepthSignConfig,
+        description="深度方向（每骨段 1 个比特）先验；默认关闭，开启后由 ik_fit 的 hinge 项执行",
+    )
     yaw: YawConfig = Field(default_factory=YawConfig)
     estimate_orientation: bool = Field(
         True, description="用肩宽/髋宽比估计身体 yaw（作为拟合先验，也进 PostProcessResult）"
@@ -117,7 +126,9 @@ def legacy_postprocess_config() -> PostProcessConfig:
             bone_sample_min_projected_ratio=0.0,
             symmetrize_bones=False,
             hold_occluded_limbs=False,
+            depth_sign_weight=0.0,
         ),
+        depth_sign=DepthSignConfig(enabled=False),
         estimate_orientation=False,
         quality=QualityConfig(enable_depth_gate=False, enable_framing_rules=False),
     )
@@ -131,6 +142,7 @@ class PostProcessResult(BaseModel):
     gaps: GapFillReport = Field(default_factory=GapFillReport)
     hands: HandStabilityReport = Field(default_factory=HandStabilityReport)
     fit: FitReport = Field(default_factory=FitReport)
+    depth_sign: DepthSignReport = Field(default_factory=DepthSignReport)
     yaw: list[YawEstimate] = Field(default_factory=list)
     tracks: list[TrackSummary] = Field(default_factory=list)
     primary_track_id: int | None = None
@@ -204,22 +216,43 @@ def run_postprocess(
     hand_report = stabilize_hands(final, config.hand_stability)
     emit("hands", "稳定手部关节", len(final), max(1, len(final)))
 
-    # 1) 身体朝向：用肩线/髋线的投影宽度算 yaw（比读 world z 可靠一个数量级）
+    # 1) 骨长标定一次，yaw / 深度符号 / IK 三处共用同一个结果（避免各自重复标定）。
     fit_config = config.ik_fit
     if config.aspect_ratio and not fit_config.aspect_ratio:
         fit_config = fit_config.model_copy(update={"aspect_ratio": config.aspect_ratio})
     aspect = fit_config.aspect_ratio or 9 / 16.0
+    lengths = calibrate_bone_lengths(final, fit_config) if fit_config.enabled else None
+
+    # 2) 身体朝向：用肩线/髋线的投影宽度算 yaw（比读 world z 可靠一个数量级）
     yaw_estimates: list[YawEstimate] = []
-    if config.estimate_orientation and fit_config.enabled:
+    if config.estimate_orientation and fit_config.enabled and lengths is not None:
         emit("yaw", "估计身体朝向", 0, max(1, len(final)))
-        lengths = calibrate_bone_lengths(final, fit_config)
         yaw_estimates = estimate_yaws(final, lengths, config.yaw, aspect=aspect)
         emit("yaw", "估计身体朝向", len(final), max(1, len(final)))
-    else:
-        lengths = None
 
-    # 2) 固定骨长 + 2D 重投影拟合：只动 world_landmarks，无效帧原样透传。
-    #    yaw 作为先验进残差，避免"肩线在深度方向的朝向"这个不可观测自由度乱跑。
+    # 3) 深度符号：单目下每根骨段只剩"Δz 取正还是取负"一个比特，逐帧由引擎 z 决定
+    #    就会来回翻（前踢腿被解成后踢腿）。这一步只产符号，不产坐标、不改幅度。
+    sign_map: dict[int, dict[str, tuple[int, float]]] = {}
+    if config.depth_sign.enabled and fit_config.enabled and lengths is not None:
+        emit("lift", "修正前后方向", 0, max(1, len(final)))
+        sign_map, depth_sign_report = estimate_depth_signs(
+            final,
+            config.depth_sign,
+            lengths=lengths,
+            aspect=aspect,
+            progress=lambda done, total_segments: emit(
+                "lift", "修正前后方向", done, total_segments
+            ),
+            should_cancel=should_cancel,
+        )
+        emit("lift", "修正前后方向", max(1, len(final)), max(1, len(final)))
+    else:
+        depth_sign_report = DepthSignReport(
+            mode="off", frames=len(final), notes=["深度符号先验未启用"]
+        )
+
+    # 4) 固定骨长 + 2D 重投影拟合：只动 world_landmarks，无效帧原样透传。
+    #    yaw 与深度符号都作为先验进残差：一个压住"肩线朝向"，一个只选"深度分支"。
     if fit_config.enabled:
         emit("ik_fit", "骨长约束拟合", 0, max(1, len(final)))
         final, fit_report = fit_frames(
@@ -227,6 +260,7 @@ def run_postprocess(
             fit_config,
             lengths=lengths,
             yaws=as_prior(yaw_estimates) if yaw_estimates else None,
+            signs=sign_map or None,
             progress=lambda done, total_steps: emit(
                 "ik_fit", "骨长约束拟合", done, total_steps
             ),
@@ -249,6 +283,8 @@ def run_postprocess(
         smoothing=smoothing_info,
         gaps=gap_report,
         fit=fit_report,
+        depth_sign=depth_sign_report,
+        aspect=aspect,
     )
     emit("quality", "生成质检报告", len(final), max(1, len(final)))
 
@@ -266,6 +302,7 @@ def run_postprocess(
         gaps=gap_report,
         hands=hand_report,
         fit=fit_report,
+        depth_sign=depth_sign_report,
         yaw=yaw_estimates,
         tracks=result.tracks,
         primary_track_id=result.primary_track_id,

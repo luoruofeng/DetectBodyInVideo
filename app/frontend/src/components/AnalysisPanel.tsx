@@ -168,6 +168,11 @@ function QualityBlock({ status, loading }: { status: JobStatus | null; loading: 
         <span>总帧 {formatCompactNumber(quality.frames_total)}</span>
         <span>插值 {quality.interpolated_frames}</span>
         {quality.max_jump_frame !== null ? <span>跳变帧 #{quality.max_jump_frame}</span> : null}
+        {summary.depthSign?.applied ? (
+          <span title="深度方向（每骨段 1 个比特）的帧间翻转次数：平滑前后对比">
+            方向翻转 {summary.depthSign.flipsBefore} → {summary.depthSign.flipsAfter}
+          </span>
+        ) : null}
         <span>处理 {summary.elapsedSeconds ? `${summary.elapsedSeconds.toFixed(1)}s` : '—'}</span>
       </div>
 
@@ -205,6 +210,8 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
   const [batch, setBatch] = useState(4)
   const [resume, setResume] = useState(true)
   const [ikFit, setIkFit] = useState(true)
+  // 深度方向修正默认关闭：它需要"时序证据"（≥30 帧）且会改变既有输出，属于可选项
+  const [depthSign, setDepthSign] = useState(false)
 
   const running = analysis.phase === 'queued' || analysis.phase === 'running'
   const selection = analysis.status?.selection
@@ -245,6 +252,7 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
       checkpoint: resume,
     },
     ikFit: { enabled: ikFit && fitAvailable },
+    postprocess: { depth_sign: { enabled: depthSign && fitAvailable, mode: 'temporal' } },
     max_frames: null,
   })
 
@@ -375,6 +383,25 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
                 disabled={running || !fitAvailable}
               />
               骨长约束拟合
+            </label>
+            <label
+              className={`flex items-center gap-1.5 text-2xs ${
+                fitAvailable ? 'cursor-pointer text-slate-400' : 'cursor-not-allowed text-slate-600'
+              }`}
+              title={
+                fitAvailable
+                  ? '深度方向修正：单目下每根骨段只剩「往前还是往后」一个比特，逐帧由引擎 z 决定会来回翻（前踢腿被解成后踢腿）。开启后用整段动作的时序一致性把方向定住，只在符号反了时纠正，不影响 2D 与骨长。至少需要 30 帧。'
+                  : '当前引擎没有输出米制世界坐标（world landmarks），无法判断深度方向'
+              }
+            >
+              <input
+                type="checkbox"
+                className="h-3 w-3 accent-accent"
+                checked={depthSign && fitAvailable}
+                onChange={(event) => setDepthSign(event.target.checked)}
+                disabled={running || !fitAvailable}
+              />
+              深度方向修正
             </label>
             <span className="ml-auto text-2xs text-slate-500">
               预计 {estimatedFrames ? `${formatCompactNumber(estimatedFrames)} 帧` : '—'}

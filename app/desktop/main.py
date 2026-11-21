@@ -160,7 +160,7 @@ def run_window(url: str, settings: Settings) -> bool:
         # 窗口关闭事件只做日志：真正的清理在 main() 的 finally 里统一执行，
         # 保证「窗口关闭 → 取消任务 → 停服务」顺序不因事件线程时序而错乱。
         if window is not None:
-            bridge.window = window
+            bridge._window = window
             window.events.closed += _on_window_closed
         webview.start(
             debug=bool(os.environ.get("DETECT_BODY_WEBVIEW_DEBUG")),

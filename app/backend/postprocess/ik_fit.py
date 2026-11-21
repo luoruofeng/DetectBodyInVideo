@@ -133,6 +133,22 @@ class FitConfig(BaseModel):
         "时先验最强；比例变小时（骨段真的朝向/远离相机，2D 已把深度大小定死）先验迅速失效，"
         "4 次方让「正面站直的小腿」被压平、而「正面伸向镜头的胳膊」不受影响",
     )
+    depth_sign_weight: float = Field(
+        1.0,
+        ge=0,
+        le=5,
+        description="深度符号先验权重（``postprocess.depth_sign`` 提供）。单目下每根骨段只剩"
+        "「Δz 取正还是取负」一个比特：骨长与 2D 投影长度已经把 |Δz| 定死，符号才是"
+        "「前踢腿被解成后踢腿」的根因。该项只在符号反了时施加惩罚（hinge），符号正确时"
+        "残差与梯度都为 0，因此不会抢 2D 重投影或骨长的任何自由度。0 = 不用符号先验",
+    )
+    depth_sign_flat_suppression: float = Field(
+        1.0,
+        ge=0,
+        le=1,
+        description="有符号先验的骨段按该比例衰减「深度压平」权重：压平会把 Δz 往 0 拽，"
+        "与符号先验直接冲突。1.0 = 完全交给符号先验；0 = 保留压平权重",
+    )
     yaw_weight: float = Field(0.6, ge=0, le=5, description="yaw 先验权重（0 = 不用 yaw）")
     max_yaw_deviation: float = Field(25.0, gt=0, le=90, description="允许偏离 2D yaw 的角度（度）")
     loss: Literal["linear", "soft_l1", "huber", "cauchy", "arctan"] = "soft_l1"
@@ -336,6 +352,11 @@ def _node_positions(points: Sequence[Landmark]) -> dict[str, np.ndarray]:
     if "left_shoulder" in positions and "right_shoulder" in positions:
         positions[CHEST] = (positions["left_shoulder"] + positions["right_shoulder"]) / 2.0
     return positions
+
+
+def node_positions(points: Sequence[Landmark]) -> dict[str, np.ndarray]:
+    """公开别名：``depth_sign`` / 质检 / 基准脚本复用同一套拓扑解析，避免多份实现漂移。"""
+    return _node_positions(points)
 
 
 def _positions_array(positions: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -769,6 +790,10 @@ class _FrameContext:
         "reproj_idx",
         "root_scale",
         "scale",
+        "sign_idx",
+        "sign_value",
+        "sign_weight",
+        "temporal_rows",
         "temporal_scale",
         "u0",
         "v0",
@@ -825,6 +850,106 @@ def _flat_scale(
     return flat
 
 
+def _sign_context(
+    signs: Mapping[str, tuple[int, float]] | None,
+    config: FitConfig,
+    scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """把 ``{骨段 key: (符号, 置信度)}`` 转成按节点下标对齐的四个数组。
+
+    权重取 ``sqrt(depth_sign_weight) * k * 置信度``：与 ``_flat_scale`` 同量纲
+    （1 米深度误差 ↔ 同等归一化图像误差），于是两个先验之间的强弱可以直接比较。
+    """
+    empty = (
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0),
+        np.zeros(0),
+        np.zeros(0),
+    )
+    if not signs or config.depth_sign_weight <= 0 or scale <= 1e-9:
+        return empty
+    indices: list[int] = []
+    values: list[float] = []
+    weights: list[float] = []
+    confidences: list[float] = []
+    base = math.sqrt(config.depth_sign_weight) * scale
+    for index, node in enumerate(NODES):
+        entry = signs.get(node.key)
+        if entry is None or node.parent is None:
+            continue
+        sign, confidence = entry
+        if sign == 0 or confidence <= 0:
+            continue
+        weight = min(1.0, float(confidence))
+        indices.append(index)
+        values.append(1.0 if sign > 0 else -1.0)
+        weights.append(base * weight)
+        confidences.append(weight)
+    return (
+        np.asarray(indices, dtype=np.int64),
+        np.asarray(values, dtype=np.float64),
+        np.asarray(weights, dtype=np.float64),
+        np.asarray(confidences, dtype=np.float64),
+    )
+
+
+def flip_signed_depth(
+    positions: Mapping[str, np.ndarray],
+    signs: Mapping[str, tuple[int, float]] | None,
+    config: FitConfig,
+) -> dict[str, np.ndarray]:
+    """按符号先验把**观测位置**换到正确的深度分支上（等距镜像，2D 与骨长不变）。
+
+    必须在 FK/遮挡判断之前做：遮挡检测比较的是"上一帧结果 vs 本帧观测"，
+    如果本帧观测还停在镜像分支上，二者会被误判成"单帧突变"而触发保持逻辑，
+    反而把姿态钉在错分支上。所以深度分支的修正在**读入这一帧时**一次做完，
+    后续所有环节（方向初值、压平门控、yaw 参考、遮挡状态）看到的是同一个姿态。
+    """
+    if not signs or config.depth_sign_weight <= 0:
+        return dict(positions)
+    flipped = dict(positions)
+    for node in NODES:  # NODES 保证父节点先于子节点，逐段翻转即为严格的等距镜像
+        if node.parent is None:
+            continue
+        entry = signs.get(node.key)
+        if entry is None or entry[0] == 0 or entry[1] <= 0:
+            continue
+        parent = flipped.get(node.parent)
+        child = flipped.get(node.key)
+        if parent is None or child is None:
+            continue
+        dz = float(child[2] - parent[2])
+        if dz == 0.0 or (dz > 0.0) == (entry[0] > 0):
+            continue
+        mirrored = np.array([child[0], child[1], 2.0 * float(parent[2]) - float(child[2])])
+        flipped[node.key] = mirrored
+    return flipped
+
+
+def _flip_depth_branch(
+    d0: np.ndarray, sign_idx: np.ndarray, sign_value: np.ndarray
+) -> np.ndarray:
+    """按符号先验把初值换到正确的深度分支上。
+
+    弱透视下 ``ΔZ`` 的正负是两个**投影完全相同、骨长完全相同**的镜像解，
+    所以这里只翻 ``d0`` 的 z 分量再归一化：2D 残差与骨长一个字都不变，
+    优化器却从一个正确分支出发，不必跨过退化流形爬过去。
+    """
+    if not len(sign_idx):
+        return d0
+    flipped = d0.copy()
+    for position, index in enumerate(sign_idx):
+        value = float(flipped[index, 2])
+        target = float(sign_value[position])
+        if value == 0.0 or (value > 0.0) == (target > 0.0):
+            continue
+        flipped[index, 2] = -value
+        norm = float(np.linalg.norm(flipped[index]))
+        if norm > 1e-9:
+            flipped[index] /= norm
+    return flipped
+
+
 def _make_context(
     frame: PoseFrame,
     positions: dict[str, np.ndarray],
@@ -834,6 +959,7 @@ def _make_context(
     previous: np.ndarray | None,
     yaw_prior: tuple[float, float] | None,
     held: Mapping[int, tuple[np.ndarray, float]] | None = None,
+    signs: Mapping[str, tuple[int, float]] | None = None,
 ) -> _FrameContext:
     keys = [node.key for node in NODES]
     index_of = {key: i for i, key in enumerate(keys)}
@@ -854,6 +980,14 @@ def _make_context(
 
     scale, u0, v0 = estimate_image_scale(frame, aspect)
     flat_scale = _flat_scale(NODES, positions, length, scale, config)
+    sign_idx, sign_value, sign_weight, sign_confidence = _sign_context(signs, config, scale)
+    # 压平先验会把不可观测的 Δz 往 0 拽，与"这块骨段的深度该往哪边"直接冲突：
+    # 有符号先验的骨段按置信度让位，没有符号先验的骨段仍按原来的门控压平。
+    if sign_idx.size and config.depth_sign_flat_suppression > 0:
+        for position, index in enumerate(sign_idx):
+            flat_scale[index] *= max(
+                0.0, 1.0 - config.depth_sign_flat_suppression * float(sign_confidence[position])
+            )
     reproj_rows: list[int] = []
     obs_u: list[float] = []
     obs_v: list[float] = []
@@ -899,8 +1033,14 @@ def _make_context(
             rotated[:, 2] = -d0[:, 0] * sin_d + d0[:, 2] * cos_d
             d0 = rotated
 
+    # 深度符号先验：先把初值换到正确的深度分支上（只翻 z，2D 与骨长完全不变）。
+    # 这一步比"让优化器自己爬过去"可靠得多：Δz 的符号在退化流形上是对称的，
+    # 从错分支出发的局部最优同样满足 2D 残差，优化器没有理由离开它。
+    d0 = _flip_depth_branch(d0, sign_idx, sign_value)
+
     # 遮挡保持：直接把初始方向换成"上一姿态随父关节旋转后"的方向，而不是让
     # 优化器从一个低置信误检的方向往回爬；参数 0 处即满足保持残差。
+    # 放在符号翻转之后：被挡住的骨段没有可信 2D，理应沿用上一姿态而不是信任先验。
     if held:
         for index, (direction, _) in held.items():
             d0[index] = _unit(direction)
@@ -953,6 +1093,23 @@ def _make_context(
     ]
     context.parent = parent
     context.flat_scale = flat_scale
+    context.sign_idx = sign_idx
+    context.sign_value = sign_value
+    context.sign_weight = sign_weight
+    # 时域 z 残差原本是"深度没有观测，只能靠上一帧拉住"的替代品。一旦某骨段有了
+    # 方向先验，它就不该再被上一帧拉走（否则动作起始帧的深度会被压回 0，
+    # 表现为"踢腿慢半拍"）。
+    # 注意必须排除**整条子树**：残差是加在关节绝对位置上的，只排除骨段自身时，
+    # 被它带动的子节点（脚尖、手）仍会把父骨段一起拽回去，排除就失效了。
+    temporal_rows = np.arange(len(NODES), dtype=np.int64)
+    if config.temporal_axes == "z" and sign_idx.size:
+        excluded = [False] * len(NODES)
+        signed = {int(index) for index in sign_idx}
+        for index in range(len(NODES)):
+            ancestor = int(parent[index])
+            excluded[index] = index in signed or (ancestor > 0 and excluded[ancestor])
+        temporal_rows = np.flatnonzero([not flag for flag in excluded]).astype(np.int64)
+    context.temporal_rows = temporal_rows
     context.scale = scale
     context.u0 = u0
     context.v0 = v0
@@ -1030,6 +1187,12 @@ def _build_sparsity(context: _FrameContext, config: FitConfig) -> np.ndarray:
             rows.append((cursor + node - 1, columns_for(node)))
         cursor += node_count - 1
 
+    # 深度符号（hinge）残差：每个带符号先验的骨段一行，依赖同一条方向参数链
+    if context.sign_idx.size:
+        for offset, node in enumerate(context.sign_idx):
+            rows.append((cursor + offset, columns_for(int(node))))
+        cursor += int(context.sign_idx.size)
+
     if context.prior_scale > 0:
         for node in range(1, node_count):
             offset = ROOT_PARAMS + 2 * (node - 1)
@@ -1039,9 +1202,9 @@ def _build_sparsity(context: _FrameContext, config: FitConfig) -> np.ndarray:
 
     if context.prev is not None and context.temporal_scale > 0:
         if config.temporal_axes == "z":
-            for node in range(node_count):
-                rows.append((cursor + node, columns_for(node)))
-            cursor += node_count
+            for offset, node in enumerate(context.temporal_rows):
+                rows.append((cursor + offset, columns_for(int(node))))
+            cursor += int(context.temporal_rows.size)
         else:
             for node in range(node_count):
                 cols = columns_for(node)
@@ -1135,6 +1298,16 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
         local_z = positions[1:, 2] - positions[context.parent[1:], 2]
         parts.append(local_z * context.flat_scale[1:])
 
+    # 深度符号先验（hinge）：只在"Δz 与先验反号"时施加惩罚。
+    # 符号正确时残差为 0、梯度为 0 → 不抢 2D 重投影与骨长硬约束的任何自由度；
+    # 幅度完全放行（|Δz| 本来就被骨长与 2D 投影长度定死），所以模型在跨域时
+    # 幅度不准也无所谓 —— 这正是本方案能抗住 OOD 的原因。
+    if context.sign_idx.size:
+        rows = context.sign_idx
+        local_z = positions[rows, 2] - positions[context.parent[rows], 2]
+        wrong = np.maximum(0.0, -context.sign_value * local_z)
+        parts.append(wrong * context.sign_weight)
+
     # 方向先验：2D 只约束"上下左右"，深度方向没有观测，必须靠先验选分支。
     # 注意它是加在**参数**（相对输入方向的偏移）上，而不是加在位置上：
     # 这样在不动点处（偏移回到 0）这项的梯度自动为 0，不会像"位置先验"那样
@@ -1145,8 +1318,10 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
     if context.prev is not None and context.temporal_scale > 0:
         delta = positions - context.prev
         if config.temporal_axes == "z":
-            # 只压深度方向的帧间跳变：x/y 由 2D 说了算，不该被上一帧拖住
-            parts.append(delta[:, 2] * context.temporal_scale)
+            # 只压深度方向的帧间跳变：x/y 由 2D 说了算，不该被上一帧拖住。
+            # 已有符号先验的骨段被排除（见 _make_context 的 temporal_rows）。
+            if context.temporal_rows.size:
+                parts.append(delta[context.temporal_rows, 2] * context.temporal_scale)
         else:
             parts.append(delta.ravel() * context.temporal_scale)
 
@@ -1245,6 +1420,7 @@ class FrameFitter:
         *,
         held: Mapping[int, tuple[np.ndarray, float]] | None = None,
         occluded: Sequence[bool] | None = None,
+        signs: Mapping[str, tuple[int, float]] | None = None,
     ) -> tuple[PoseFrame, FrameFitReport]:
         """不做 2D 拟合时的兜底：尽量把骨长归一，而不是原样透传。
 
@@ -1270,6 +1446,7 @@ class FrameFitter:
             self.config,
             self.config.aspect_ratio or DEFAULT_ASPECT,
             held=held,
+            signs=signs,
         )
         if rigid is None:
             return commit(frame.model_copy(deep=True)), report
@@ -1278,7 +1455,11 @@ class FrameFitter:
         return commit(rigid), report
 
     def fit(
-        self, frame: PoseFrame, *, yaw: tuple[float, float] | None = None
+        self,
+        frame: PoseFrame,
+        *,
+        yaw: tuple[float, float] | None = None,
+        signs: Mapping[str, tuple[int, float]] | None = None,
     ) -> tuple[PoseFrame, FrameFitReport]:
         config = self.config
         report = FrameFitReport(index=frame.index)
@@ -1294,13 +1475,18 @@ class FrameFitter:
             return frame.model_copy(deep=True), report
 
         if frame.mean_visibility(CORE_INDICES) < config.min_visibility:
-            return self._fallback(frame, "跳过（核心关节平均可见度过低）")
+            return self._fallback(
+                frame, "跳过（核心关节平均可见度过低）", signs=signs
+            )
 
         positions = _node_positions(frame.world_landmarks)
         if not positions:
             report.note = "跳过（世界坐标不完整）"
             return frame.model_copy(deep=True), report
 
+        # 先把观测换到正确深度分支上，再进遮挡判断与 FK：否则"上一帧结果（已修正）vs
+        # 本帧观测（未修正）"会被误判成单帧突变，触发保持逻辑反而钉住错分支。
+        positions = flip_signed_depth(positions, signs, config)
         current_array = _positions_array(positions)
         held: dict[int, tuple[np.ndarray, float]] = {}
         occluded = [False] * len(NODES)
@@ -1318,11 +1504,23 @@ class FrameFitter:
         report.held_joints = [NODES[index].key for index in sorted(held)]
 
         context = _make_context(
-            frame, positions, self.lengths, config, aspect, self._previous, yaw, held=held
+            frame,
+            positions,
+            self.lengths,
+            config,
+            aspect,
+            self._previous,
+            yaw,
+            held=held,
+            signs=signs,
         )
         if context.scale <= 1e-9:
             return self._fallback(
-                frame, "跳过（弱透视尺度估计失败）", held=held, occluded=occluded
+                frame,
+                "跳过（弱透视尺度估计失败）",
+                held=held,
+                occluded=occluded,
+                signs=signs,
             )
 
         initial = np.zeros(ROOT_PARAMS + 2 * (len(NODES) - 1), dtype=np.float64)
@@ -1354,7 +1552,9 @@ class FrameFitter:
             )
         except Exception as exc:  # pragma: no cover - 数值异常兜底
             logger.debug("第 %s 帧拟合失败：%s", frame.index, exc)
-            return self._fallback(frame, f"求解失败：{exc}", held=held, occluded=occluded)
+            return self._fallback(
+                frame, f"求解失败：{exc}", held=held, occluded=occluded, signs=signs
+            )
 
         fitted = _forward_kinematics(solution.x, context)
         reproj, bone = _residual_metrics(fitted, context)
@@ -1381,6 +1581,7 @@ class FrameFitter:
                 f"初始 {initial_reproj:.4f}）",
                 held=held,
                 occluded=occluded,
+                signs=signs,
             )
 
         report.fitted = True
@@ -1421,6 +1622,7 @@ def _rigidify(
     aspect: float,
     *,
     held: Mapping[int, tuple[np.ndarray, float]] | None = None,
+    signs: Mapping[str, tuple[int, float]] | None = None,
 ) -> PoseFrame | None:
     """不做最小二乘，只把"观测方向 + 标定骨长"重新走一遍 FK。
 
@@ -1433,7 +1635,11 @@ def _rigidify(
     positions = _node_positions(frame.world_landmarks)
     if not positions:
         return None
-    context = _make_context(frame, positions, lengths, config, aspect, None, None, held=held)
+    # 保留符号先验：兜底路径的职责是"不做最小二乘"，不是"把已经选对的分支退回去"。
+    positions = flip_signed_depth(positions, signs, config)
+    context = _make_context(
+        frame, positions, lengths, config, aspect, None, None, held=held, signs=signs
+    )
     worst = 0.0
     for i, node in enumerate(NODES):
         if node.parent is None or (held and i in held):
@@ -1457,13 +1663,14 @@ def fit_frame(
     config: FitConfig | None = None,
     *,
     yaw: tuple[float, float] | None = None,
+    signs: Mapping[str, tuple[int, float]] | None = None,
 ) -> tuple[PoseFrame, FrameFitReport]:
     """单帧拟合（无时域项），便于单测与离线调试。"""
     config = config or FitConfig()
     if not config.enabled:
         return frame.model_copy(deep=True), FrameFitReport(index=frame.index, note="未启用")
     fitter = FrameFitter(lengths, config.model_copy(update={"temporal_weight": 0.0}))
-    return fitter.fit(frame, yaw=yaw)
+    return fitter.fit(frame, yaw=yaw, signs=signs)
 
 
 def fit_frames(
@@ -1472,10 +1679,14 @@ def fit_frames(
     *,
     lengths: BoneLengths | None = None,
     yaws: Mapping[int, tuple[float, float]] | None = None,
+    signs: Mapping[int, Mapping[str, tuple[int, float]]] | None = None,
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[PoseFrame], FitReport]:
     """整段拟合。无效帧、缺 world landmarks 的帧原样透传。
+
+    ``signs`` 是 ``{帧号: {骨段 key: (符号, 置信度)}}`` 的深度符号先验
+    （由 ``postprocess.depth_sign`` 生成）。为空时行为与没有这一层完全一致。
 
     ``progress(done, total)`` 按趟累计帧数上报；``should_cancel`` 在每帧检查，
     让长视频的 IK 拟合可以被用户取消（否则 2 万帧会卡住整个任务）。
@@ -1511,7 +1722,8 @@ def fit_frames(
             if should_cancel is not None and should_cancel():
                 raise AnalysisCancelledError("后处理已取消")
             yaw = None if yaws is None else yaws.get(frame.index)
-            fitted, report = fitter.fit(frame, yaw=yaw)
+            frame_signs = None if signs is None else signs.get(frame.index)
+            fitted, report = fitter.fit(frame, yaw=yaw, signs=frame_signs)
             outputs.append(fitted)
             reports.append(report)
             done_steps += 1
@@ -1534,6 +1746,13 @@ def fit_frames(
     notes: list[str] = list(lengths.notes)
     if yaws:
         notes.append(f"已使用 {len(yaws)} 帧的 2D yaw 作为拟合先验")
+    if signs:
+        used = sum(1 for frame in ordered if signs.get(frame.index))
+        if used:
+            notes.append(
+                f"{used} 帧使用深度符号先验约束前后方向"
+                f"（权重 {config.depth_sign_weight:.2f}，压平抑制 {config.depth_sign_flat_suppression:.2f}）"
+            )
     skipped = len(per_frame) - len(fitted_reports)
     rigidified = sum(1 for item in per_frame if item.rigidified)
     held_frames = sum(1 for item in per_frame if item.held_joints)
@@ -1615,6 +1834,8 @@ __all__ = [
     "calibrate_bone_lengths",
     "estimate_image_scale",
     "fit_frame",
+    "flip_signed_depth",
     "fit_frames",
     "load_bone_lengths_override",
+    "node_positions",
 ]

@@ -236,6 +236,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 | 批处理 | 4 | 可选 1/2/4/8；MediaPipe 不支持 batch，会退化为逐帧 |
 | 断点续算 | 开启 | 同时设置 `checkpoint=true` 与 `resume=true` |
 | 骨长约束拟合 | 开启 | 仅在所选引擎能输出米制 world landmarks 时生效；ONNX 引擎会置灰并关闭 |
+| 深度方向修正 | 关闭 | 单目下每根骨段只剩「往前还是往后」一个比特；开启后用整段动作的时序一致性把它定住（前踢腿不再被解成后踢腿）。需要 ≥30 帧，只在符号反了时纠正，不动 2D 与骨长 |
 
 面板会显示「预计 N 帧」。所有参数在任务运行期间禁用。手/脸增强固定开启（界面无开关）；面板底部还有「清空缓存」按钮，删除断点文件让下次识别从第 1 帧重新开始。
 
@@ -855,6 +856,8 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | `DETECT_BODY_IK_FIT_MAX_NFEV` | `60` | 每帧求解函数求值上限，1–500 |
 | `DETECT_BODY_IK_FIT_FOV_DEGREES` | `60.0` | 相机水平视场角，10–150 度 |
 | `DETECT_BODY_Z_SMOOTHING_SCALE` | `0.3` | Z 轴 min_cutoff 相对 x/y 的系数 |
+| `DETECT_BODY_DEPTH_SIGN_ENABLED` | `false` | 置 `1` 时全局启用深度方向修正（即使界面开关未勾选） |
+| `DETECT_BODY_DEPTH_SIGN_MODE` | `temporal` | 后端：`temporal` 用世界坐标 z 做时序一致性（零新增依赖）/ `model` 用 ONNX 抬升器判方向 |
 
 > 另有两个**不由 `Settings` 解析**的环境变量：`DETECT_BODY_WEBVIEW_DEBUG`（设置任意值打开 pywebview debug，由 `app/desktop/main.py` 直接读取）与 `DETECT_BODY_CONSOLE`（值为 `1` 时打包保留控制台，由 `scripts/package.*` 在打包阶段读取）。它们不会出现在 `Settings` 字段中。
 
@@ -1074,8 +1077,9 @@ pytest tests/test_export.py -q
 | 脚本 | 常用命令 | 作用 |
 | --- | --- | --- |
 | `scripts/bench.py` | `python scripts/bench.py --engine stub --synthetic --batch 1,4` | 推理链路吞吐基准；`--engine` 可选 `stub` / `auto` / `mediapipe` / `onnx` |
-| `scripts/bench_depth.py` | `python scripts/bench_depth.py --synthetic --json out/depth.json` | 深度 / 几何质量基准：`z_jitter`、`bone_length_cv`、`reproj_error_px`、`angle_drift_deg` |
+| `scripts/bench_depth.py` | `python scripts/bench_depth.py --synthetic --json out/depth.json` | 深度 / 几何质量基准：`z_jitter`、`bone_length_cv`、`reproj_error_px`、`angle_drift_deg`、`depth_sign_flips`、`sagittal_motion_share` |
 | `scripts/bench_z_smoothing.py` | `python scripts/bench_z_smoothing.py --json out/z_params.json` | Z 轴 One Euro 参数 A/B |
+| `scripts/export_videopose3d_onnx.py` | `python scripts/export_videopose3d_onnx.py --verify models/videopose3d-h36m.onnx` | 把 VideoPose3D 离线导出为 ONNX（供 `DETECT_BODY_DEPTH_SIGN_MODE=model`），或校验已有权重 |
 | `scripts/make_icon.py` | `python scripts/make_icon.py` | 无第三方依赖生成 512 PNG 与 256 ICO 图标 |
 
 `scripts/bench.py` 默认引擎是 `stub`，只验证基准工具与队列 / batch 链路，**不代表真实模型性能**。真实性能必须显式传 `--engine auto|mediapipe|onnx`。
@@ -1357,6 +1361,10 @@ python scripts/bench_depth.py samples/BM-01-front-full.mp4 --json out/BM-01.json
 # 与上次结果对比
 python scripts/bench_depth.py samples/BM-01-front-full.mp4 --baseline out/BM-01.json
 
+# 深度方向修正 A/B（对比 depth_sign_flips 与 sagittal_motion_share）
+python scripts/bench_depth.py samples/kick.mp4 --depth-sign --json out/kick-on.json
+python scripts/bench_depth.py samples/kick.mp4 --json out/kick-off.json --baseline out/kick-on.json
+
 # Z 轴滤波器调参
 python scripts/bench_z_smoothing.py --json out/z_params.json
 ```
@@ -1464,6 +1472,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 - 补帧只处理长度 ≤5 的内部缺口；片头片尾和长缺口保持 `valid=false`。`densify(stride>1)` 在末帧不对齐步长时可能漏掉末帧。
 - IK 只修改 world 点、不改 2D 关键点；根平移只优化 x/y，z 沿用引擎估计值。无 SciPy 时仅做骨长钳制，不做最小二乘优化。
 - 深度压平先验是**用精度换合理性**：它会让重投影误差从约 5 px 升到约 9 px（1080p，0.5% 画面高度以内），换来的是不再凭空出现十几厘米的屈膝。需要极限 2D 一致性时把 `depth_flat_weight` 调低到 0.5 或 0。
+- 单目 RGB 下每根骨段的深度**只剩一个比特**（骨长与 2D 投影长度已把 `|Δz|` 定死，`ΔZ = ±√(L² − ΔX² − ΔY²)`）。「向前踢腿」在正面机位就是典型的两个等价解，`depth_sign` 只是用运动先验替观众做选择，**不是把不可观测量变成可观测**，所以导出仍标记 `depthIsEstimated`；要物理上可靠请改用正侧机位。`temporal` 后端只能消除帧间翻转、无法纠正整体方向，要判断「朝前还是朝后」必须用 `model` 后端并自备 ONNX 权重。
 - 补帧现在同时插值 `world_landmarks`；若有效帧本身没有世界坐标（例如 ONNX 引擎），导出 3D 关节为空并在 `notes` 提示改用能输出 world landmarks 的引擎，不会回退到身高标定反解。
 - 任务结果与预览只在内存，服务重启后任务丢失；断点文件独立保存在 `~/.detect-body/checkpoints/`，其 key 由版本号、文件名/大小/mtime、探测到的 fps/帧数和采样计划共同派生（SHA-1 前 16 位），不是内容 hash。
 - 导出回读校验是一次性 `read_text()`，超大文件会占用内存；写出本身是流式的。

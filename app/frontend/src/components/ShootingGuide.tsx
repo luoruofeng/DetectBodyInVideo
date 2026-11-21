@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 /**
  * 拍摄建议（任务 6.1 / 6.3）。
@@ -109,14 +109,18 @@ export function ShootingGuideDialog() {
     }
   })
 
-  const close = () => {
-    setOpen(false)
+  const close = useCallback(() => setOpen(false), [])
+
+  // 点击/Esc 只更新 React 状态；localStorage 同步写盘放到渲染完成后，
+  // 避免在关闭弹层的同一帧里做磁盘 IO 拖慢首帧。
+  useEffect(() => {
+    if (open) return
     try {
       window.localStorage.setItem(STORAGE_KEY, '1')
     } catch {
       /* 隐私模式下 localStorage 不可用，忽略即可 */
     }
-  }
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -125,15 +129,21 @@ export function ShootingGuideDialog() {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [close, open])
 
   if (!open) return null
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-lg space-y-4 rounded-xl border border-line bg-panel p-5 shadow-2xl">
+    <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-black/70 p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="shooting-guide-title"
+        className="max-h-[calc(100vh-2rem)] w-full max-w-lg space-y-4 overflow-y-auto rounded-xl border border-line bg-panel p-5 shadow-2xl"
+      >
         <div className="space-y-1">
-          <h2 className="text-sm font-medium text-slate-200">开拍前先看一眼：怎么拍，深度才可信</h2>
+          <h2 id="shooting-guide-title" className="text-sm font-medium text-slate-200">
+            开拍前先看一眼：怎么拍，深度才可信
+          </h2>
           <p className="text-2xs leading-relaxed text-slate-500">
             后期只能修正抖动，修不出没拍到的信息。同一个算法，素材不同结果能差一个量级。
           </p>

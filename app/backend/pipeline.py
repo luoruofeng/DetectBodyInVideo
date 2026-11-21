@@ -30,6 +30,7 @@ from app.backend.media.probe import VideoProbe, probe_video
 from app.backend.media.sampling import AnalysisPlan, SamplingConfig, build_analysis_plan
 from app.backend.perf.config import RuntimeConfig
 from app.backend.perf.runner import RuntimeProgress, run_inference
+from app.backend.postprocess.depth_sign import DepthSignConfig
 from app.backend.postprocess.ik_fit import FitConfig
 from app.backend.postprocess.pipeline import (
     PostProcessConfig,
@@ -264,6 +265,13 @@ def analyze_video(
             }
         )
     post_updates["ik_fit"] = ik_config
+    # 深度符号先验：请求体显式开启优先；服务级配置只能"打开默认值"，不能覆盖显式参数。
+    depth_sign_config = options.postprocess.depth_sign
+    if settings.depth_sign_enabled and not depth_sign_config.enabled:
+        depth_sign_config = depth_sign_config.model_copy(update={"enabled": True})
+    if depth_sign_config.mode == DepthSignConfig().mode:
+        depth_sign_config = depth_sign_config.model_copy(update={"mode": settings.depth_sign_mode})
+    post_updates["depth_sign"] = depth_sign_config
     post_config = options.postprocess.model_copy(update=post_updates)
     postprocess = run_postprocess(
         frames, post_config, progress=forward_post, should_cancel=should_cancel
@@ -319,6 +327,15 @@ def summarize(result: AnalysisResult) -> dict[str, object]:
             key: value
             for key, value in result.postprocess.fit.model_dump(mode="json").items()
             if key != "per_frame"
+        },
+        "depthSign": {
+            "applied": result.postprocess.depth_sign.applied,
+            "mode": result.postprocess.depth_sign.mode,
+            "segments": result.postprocess.depth_sign.segments,
+            "flipsBefore": result.postprocess.depth_sign.flips_before,
+            "flipsAfter": result.postprocess.depth_sign.flips_after,
+            "disagreements": result.postprocess.depth_sign.disagreements,
+            "notes": result.postprocess.depth_sign.notes,
         },
         "hands": {
             "applied": result.postprocess.hands.applied,

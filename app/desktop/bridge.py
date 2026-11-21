@@ -78,14 +78,23 @@ def _first_path(result: object) -> str:
 
 
 class DesktopBridge:
-    """挂到 ``webview.create_window(js_api=...)`` 上的对象，方法即前端 API。"""
+    """挂到 ``webview.create_window(js_api=...)`` 上的对象，方法即前端 API。
+
+    注意：pywebview 注入 JS API 时会**递归遍历本对象所有公开的非可调用属性**
+    （``webview.util.inject_pywebview`` → ``get_functions``），对每个属性做
+    ``getattr`` 并继续向下递归。因此这里绝不能用公开属性保存 pywebview 的
+    ``Window``：``Window.native`` 会拿到 WinForms 窗口，递归随即进入 .NET 对象
+    图，最终在 ``Accessibility`` 的跨进程 COM 调用上空等；而该线程正持有 GIL，
+    桌面壳的 UI 线程（定时器 / WebView2 事件回调）会卡在 ``PyGILState_Ensure``，
+    表现为整个窗口「未响应」。带下划线的属性会被跳过，所以用 ``_window``。
+    """
 
     def __init__(self) -> None:
-        self.window: object | None = None
+        self._window: object | None = None
 
     def choose_export_path(self, default_name: str = "export.json") -> str:
         """弹系统「另存为」对话框，返回绝对路径；取消或失败返回空字符串。"""
-        window = self.window
+        window = self._window
         if window is None:
             return ""
         try:

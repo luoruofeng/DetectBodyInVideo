@@ -6,7 +6,11 @@
 1. ``z_jitter``       相邻帧 ``world_landmarks.z`` 的 RMS（米），按 躯干/四肢/末端 分组；
 2. ``bone_length_cv`` 每条骨段长度的变异系数（std/mean），基线预期 > 3%；
 3. ``reproj_error_px`` 把 ``world_landmarks`` 反投影回像素后与 ``landmarks`` 的平均误差；
-4. ``angle_drift_deg`` 膝/肘/髋角的帧间标准差（"静止站立"片段里越小越好）。
+4. ``angle_drift_deg`` 膝/肘/髋角的帧间标准差（"静止站立"片段里越小越好）；
+5. ``depth_sign_flips`` 每条骨段 ``sign(Δz)`` 的帧间翻转次数 —— 单目只剩"一个比特"
+   的歧义指标，"前踢腿被解成后踢腿"就长在这个数上；
+6. ``sagittal_motion_share`` 四肢顺着镜头方向伸展的帧占比，是上面那个歧义能否被
+   观测到的**拍摄期**判据（越高说明越该补拍侧视机位）。
 
 用法：
 
@@ -60,6 +64,8 @@ REGRESSION_LIMITS: dict[str, float] = {
     "bone_length_cv_max": 0.25,
     "reproj_error_px": 0.10,
     "angle_drift_deg": 0.15,
+    "depth_sign_flips": 0.30,
+    "sagittal_motion_share": 0.30,
 }
 
 
@@ -263,6 +269,51 @@ def yaw_comparison(frames: Sequence[PoseFrame], *, truth_deg: float | None = Non
     }
 
 
+def depth_sign_flips(frames: Sequence[PoseFrame]) -> dict[str, Any]:
+    """每条骨段 ``sign(Δz)`` 的帧间翻转次数（单目 1-bit 歧义的直接指标）。
+
+    为什么单列这一项：弱透视下骨长与 2D 投影长度把 ``|Δz|`` 定死，**只剩符号**。
+    正确还原的片段里，除真正的方向反转外翻转次数应接近 0；"腿朝反方向踢"这类
+    故障的表现就是同一骨段在一段动作内反复翻面。
+    """
+    ordered = [frame for frame in sorted(frames, key=lambda item: item.index) if frame.valid]
+    per_key: dict[str, int] = {}
+    for node in BONE_SEGMENTS:
+        signs: list[int] = []
+        for frame in ordered:
+            positions = node_positions(frame)
+            if not positions:
+                continue
+            parent = positions.get(node.parent or "")
+            child = positions.get(node.key)
+            if parent is None or child is None:
+                continue
+            dz = float(child[2] - parent[2])
+            if abs(dz) < 1e-3:
+                continue
+            signs.append(1 if dz > 0 else -1)
+        if not signs:
+            continue
+        per_key[node.key] = sum(
+            1 for a, b in zip(signs, signs[1:], strict=False) if a != b
+        )
+    return {
+        "total": int(sum(per_key.values())),
+        "active_segments": int(sum(1 for value in per_key.values() if value)),
+        "worst": int(max(per_key.values())) if per_key else 0,
+        "per_segment": per_key,
+    }
+
+
+def sagittal_motion_share(
+    frames: Sequence[PoseFrame], *, aspect: float, threshold: float = 0.5
+) -> float:
+    """四肢骨段"顺着镜头方向"的帧占比（0~1）。复用质检同口径实现，保证数字可比。"""
+    from app.backend.postprocess.quality import sagittal_motion_share as _share
+
+    return round(_share(frames, aspect=aspect, threshold=threshold), 4)
+
+
 def reprojection_summary(
     frames: Sequence[PoseFrame], *, aspect: float, width: float, height: float
 ) -> dict[str, float]:
@@ -325,6 +376,7 @@ def _analyze(
         "engineDisplayName": result.selection.display_name,
         "verdict": result.postprocess.quality.verdict,
         "fitMsPerFrame": getattr(fit, "milliseconds_per_frame", None),
+        "depthSignApplied": result.postprocess.depth_sign.applied,
     }
     return (
         result.postprocess.frames,
@@ -361,6 +413,10 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
         smoothing = smoothing.model_copy(update=updates)
     if args.no_smoothing:
         smoothing = smoothing.model_copy(update={"method": "none"})
+    if getattr(args, "depth_sign", False) and hasattr(postprocess, "depth_sign"):
+        postprocess = postprocess.model_copy(
+            update={"depth_sign": postprocess.depth_sign.model_copy(update={"enabled": True})}
+        )
     return postprocess.model_copy(update={"smoothing": smoothing})
 
 
@@ -382,6 +438,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "engineDisplayName": "确定性合成序列（tests/synth_pose.py）",
             "verdict": postprocess.quality.verdict,
             "fitMsPerFrame": getattr(fit, "milliseconds_per_frame", None),
+            "depthSignApplied": postprocess.depth_sign.applied,
         }
         timing = {
             "postprocessSeconds": round(elapsed, 4),
@@ -421,6 +478,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             frames, aspect=aspect, width=width, height=height
         ),
         "angle_drift_deg": angle_drift(frames),
+        "depth_sign_flips": depth_sign_flips(frames),
+        "sagittal_motion_share": sagittal_motion_share(frames, aspect=aspect),
         "timing": timing,
         "env": {
             "platform": f"{platform.system()} / {platform.machine()}",
@@ -447,6 +506,8 @@ def _flat(metrics: dict[str, Any]) -> dict[str, float]:
         flat[key] = float(metrics.get(key) or 0.0)
     flat["reproj_error_px"] = float((metrics.get("reproj_error_px") or {}).get("mean", 0.0))
     flat["angle_drift_deg"] = float((metrics.get("angle_drift_deg") or {}).get("mean", 0.0))
+    flat["depth_sign_flips"] = float((metrics.get("depth_sign_flips") or {}).get("total", 0))
+    flat["sagittal_motion_share"] = float(metrics.get("sagittal_motion_share") or 0.0)
     yaw = metrics.get("yaw") or {}
     for key, source in (
         ("yaw_error_width_deg", "width_error_deg"),
@@ -510,6 +571,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-ik-fit", action="store_true", help="关闭骨长约束拟合（A/B）")
     parser.add_argument("--no-z-smoothing", action="store_true", help="关闭 z 轴强平滑（A/B）")
     parser.add_argument("--no-smoothing", action="store_true", help="完全关闭平滑（A/B）")
+    parser.add_argument(
+        "--depth-sign",
+        action="store_true",
+        help="开启深度符号先验（时序一致性），对比 depth_sign_flips 前后的变化",
+    )
     args = parser.parse_args(argv)
 
     metrics = run(args)

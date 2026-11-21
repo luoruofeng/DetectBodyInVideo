@@ -114,6 +114,14 @@ class Settings(BaseSettings):
         le=1,
         description="z 轴 min_cutoff 相对 x/y 的系数（z 噪声比 x/y 大一个数量级，故显著更小）",
     )
+    # 深度方向（每骨段 1 个比特）先验：默认关闭，开启后由 ik_fit 的 hinge 项执行。
+    # temporal = 用 world z 做时序一致性（零新增依赖）；model = 用可选 ONNX 抬升器判方向。
+    depth_sign_enabled: bool = Field(
+        False, description="深度符号先验默认开关（DETECT_BODY_DEPTH_SIGN_ENABLED）"
+    )
+    depth_sign_mode: Literal["temporal", "model"] = Field(
+        "temporal", description="深度符号先验后端：temporal 零依赖 / model 需 ONNX 权重"
+    )
 
     # ---- 姿态引擎（任务 4） ----
     pose_engine: Literal["auto", "mediapipe", "onnx"] = "auto"

@@ -90,6 +90,20 @@ export interface FitSummary {
   notes: string[]
 }
 
+/** 深度方向（每骨段 1 个比特）先验的执行结果。 */
+export interface DepthSignSummary {
+  applied: boolean
+  mode: 'temporal' | 'model' | 'off' | string
+  /** 实际下发的 (帧 × 骨段) 符号数量 */
+  segments: number
+  /** 原始符号序列的帧间翻转次数 */
+  flipsBefore: number
+  /** 时序平滑后下发符号的帧间翻转次数 */
+  flipsAfter: number
+  disagreements: number
+  notes: string[]
+}
+
 export interface AnalysisSummary {
   engine: string
   engineDisplayName: string
@@ -100,6 +114,8 @@ export interface AnalysisSummary {
   elapsedSeconds: number
   quality: QualitySummary
   fit: FitSummary
+  /** 深度方向先验（后端字段 depthSign）；默认关闭时 mode 为 'off' */
+  depthSign?: DepthSignSummary
   tracks: TrackSummary[]
   primaryTrackId: number | null
   targetTrackId: number | null
@@ -223,6 +239,19 @@ export interface FitOptions {
   min_visibility?: number
 }
 
+/** 深度方向先验：单目下每根骨段只剩"Δz 取正还是取负"一个比特。 */
+export interface DepthSignOptions {
+  enabled?: boolean
+  /** temporal = 用世界坐标 z 做时序一致性（零新增依赖）；model = 需下载 ONNX 权重 */
+  mode?: 'temporal' | 'model'
+  window?: number
+  min_agreement?: number
+}
+
+export interface PostprocessOptions {
+  depth_sign?: DepthSignOptions
+}
+
 export interface AnalysisOptions {
   engine?: EngineKind
   sampling?: SamplingOptions
@@ -231,6 +260,7 @@ export interface AnalysisOptions {
   perf?: PerfOptions
   /** 骨长约束拟合（后端字段 ik_fit，HTTP 别名为 ikFit） */
   ikFit?: FitOptions
+  postprocess?: PostprocessOptions
   max_frames?: number | null
 }
 

@@ -116,6 +116,22 @@ def test_desktop_bridge_returns_empty_without_window() -> None:
     assert desktop_bridge.DesktopBridge().choose_export_path("a.json") == ""
 
 
+def test_desktop_bridge_has_no_public_attributes() -> None:
+    """js_api 对象上不能挂公开的非可调用属性。
+
+    pywebview 注入 JS API 时会递归遍历 js_api 的所有公开属性（``get_functions``），
+    一旦把 pywebview 的 Window 挂成公开属性，递归会走进 ``Window.native`` 的
+    WinForms/.NET 对象图，最后卡在 Accessibility 的跨进程 COM 调用上；该线程持有
+    GIL，桌面壳 UI 线程随之卡在 PyGILState_Ensure，整个窗口「未响应」。
+    """
+
+    bridge = desktop_bridge.DesktopBridge()
+    public = [name for name in dir(bridge) if not name.startswith("_")]
+    for name in public:
+        attr = getattr(bridge, name)
+        assert callable(attr), f"{name} 是公开非可调用属性，会被 pywebview 递归遍历"
+
+
 def test_desktop_dir_exists() -> None:
     assert desktop_bridge.desktop_dir().is_dir()
 
