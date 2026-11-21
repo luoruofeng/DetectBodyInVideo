@@ -74,6 +74,11 @@ class PreviewFrame(BaseModel):
     joints: dict[str, PreviewJoint] = Field(default_factory=dict)
     angles: dict[str, float] = Field(default_factory=dict)
     bbox: BoundingBox | None = None
+    hipHeight: float | None = Field(
+        None,
+        description="髋到最低着地点（踝/脚尖）的竖直距离（米，已做零相位平滑）。"
+        "3D 预览用它把脚底放到地面；缺省表示该帧没有可信的着地参考",
+    )
 
 
 class FramesPayload(BaseModel):
@@ -273,6 +278,13 @@ def get_frames(
                 ),
                 angles={name: round(value, 2) for name, value in angles.items()},
                 bbox=pose.bbox,
+                hipHeight=(
+                    round(converted.ground_span, 4)
+                    if converted is not None
+                    and converted.ground_span is not None
+                    and converted.ground_span > 0
+                    else None
+                ),
             )
         )
 

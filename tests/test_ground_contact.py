@@ -111,6 +111,114 @@ def test_anchor_feet_ignores_frames_without_feet() -> None:
     assert all(frame.root.length == pytest.approx(0.0) for frame in anchored)
 
 
+def _converted_pair(index: int, left_span: float, right_span: float) -> ConvertedFrame:
+    """双脚各给一条踝点；span = 髋到脚的竖直距离（米）。"""
+    return ConvertedFrame(
+        index=index,
+        t=index / 30.0,
+        joints={
+            "left_foot_joint": JointPosition(y=-left_span, visibility=0.95),
+            "right_foot_joint": JointPosition(y=-right_span, visibility=0.95),
+        },
+    )
+
+
+def test_anchor_suppresses_span_jitter_without_lagging_squat() -> None:
+    """原地动作：脚没动，但逐帧跨度噪声曾原样变成整段髋部上下抖动。"""
+    frames = [
+        _converted_pair(index, 0.90 + (0.02 if index % 2 else -0.02), 0.90 + (0.02 if index % 2 else -0.02))
+        for index in range(31)
+    ]
+    anchored, references = anchor_feet_to_ground(frames)
+    heights = [frame.root.y for frame in anchored]
+
+    # 平滑前 ±2 cm 的逐帧抖动，平滑后应基本消失。
+    assert max(heights) - min(heights) < 0.005
+    assert references[0].span_jitter_after_meters < references[0].span_jitter_before_meters * 0.5
+
+
+def test_support_foot_hysteresis_prevents_root_bob() -> None:
+    """两脚差不多高时，支撑脚不能在噪声里来回切换（否则 root.y 会阶跃）。"""
+    frames = [
+        _converted_pair(index, 0.94, 0.94 if index % 2 == 0 else 0.955)
+        for index in range(21)
+    ]
+    anchored, _ = anchor_feet_to_ground(frames)
+    heights = [frame.root.y for frame in anchored]
+    assert max(heights) - min(heights) < 1e-3
+
+    # 关掉滞回与平滑时，同一段输入必然抖起来 —— 证明上一条不是恒等断言。
+    loose = GroundContactConfig(switch_margin_meters=0.0, smooth_cutoff_hz=0.0)
+    raw, _ = anchor_feet_to_ground(frames, loose)
+    raw_heights = [frame.root.y for frame in raw]
+    assert max(raw_heights) - min(raw_heights) > 0.005
+
+
+def test_anchor_reports_smoothed_ground_span_for_preview() -> None:
+    anchored, _ = anchor_feet_to_ground([_converted(0, -0.90), _converted(1, -0.90)])
+    assert anchored[0].ground_span == pytest.approx(0.94, abs=1e-5)
+
+    skipped, _ = anchor_feet_to_ground([_converted(0, -0.90), ConvertedFrame(index=1, valid=False)])
+    assert skipped[1].ground_span is None
+
+
+def test_anchor_holds_span_when_foot_temporarily_hidden() -> None:
+    """脚被遮挡一帧时沿用邻居的跨度，而不是把 root.y 弹回 0（整个身体蹦一下）。"""
+    hidden = ConvertedFrame(index=3, t=3 / 30.0, joints={})
+    frames = [
+        hidden if frame.index == 3 else frame
+        for frame in (_converted_pair(index, 0.60, 0.60) for index in range(7))
+    ]
+    anchored, _ = anchor_feet_to_ground(frames)
+    heights = [frame.root.y for frame in anchored]
+    assert max(heights) - min(heights) < 1e-3
+
+
+def _distance(a: JointPosition, b: JointPosition) -> float:
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+
+def _converted_leg(index: int, jitter: float) -> ConvertedFrame:
+    """一条微屈的腿：髋 → 膝（略向前）→ 踝 → 脚尖，竖直方向带 jitter。"""
+    return ConvertedFrame(
+        index=index,
+        t=index / 30.0,
+        joints={
+            "left_upLeg_joint": JointPosition(x=0.09, y=0.0, visibility=0.95),
+            "left_leg_joint": JointPosition(x=0.09, y=-0.42, z=0.12, visibility=0.95),
+            "left_foot_joint": JointPosition(x=0.09, y=-0.80 + jitter, z=0.02, visibility=0.95),
+            "left_toes_joint": JointPosition(
+                x=0.09, y=-0.84 + jitter, z=0.08, visibility=0.95
+            ),
+        },
+    )
+
+
+def test_lock_support_foot_keeps_contact_height_constant() -> None:
+    """只调 root.y 时脚自身仍随噪声上下跳；锁定后脚底高度应恒定，骨长不变。"""
+    frames = [_converted_leg(index, 0.02 if index % 2 else -0.02) for index in range(31)]
+    anchored, _ = anchor_feet_to_ground(frames)
+
+    contact_heights = [
+        frame.root.y + frame.joints["left_toes_joint"].y for frame in anchored
+    ]
+    assert max(contact_heights) - min(contact_heights) < 5e-4
+
+    for before, after in zip(frames, anchored, strict=True):
+        thigh_before = _distance(before.joints["left_upLeg_joint"], before.joints["left_leg_joint"])
+        thigh_after = _distance(after.joints["left_upLeg_joint"], after.joints["left_leg_joint"])
+        assert thigh_after == pytest.approx(thigh_before, abs=1e-6)
+        shank_before = _distance(before.joints["left_leg_joint"], before.joints["left_foot_joint"])
+        shank_after = _distance(after.joints["left_leg_joint"], after.joints["left_foot_joint"])
+        assert shank_after == pytest.approx(shank_before, abs=1e-6)
+
+    unlocked, _ = anchor_feet_to_ground(frames, GroundContactConfig(lock_support_foot=False))
+    unlocked_heights = [
+        frame.root.y + frame.joints["left_toes_joint"].y for frame in unlocked
+    ]
+    assert max(unlocked_heights) - min(unlocked_heights) > 0.005
+
+
 def test_bundle_squat_restores_hip_descent_and_plants_feet() -> None:
     frames = [_make_pose_frame(0), _make_pose_frame(1), _make_pose_frame(2, squat=True)]
     bundle = build_skeleton_bundle(frames, SkeletonConfig(include_optional=True))

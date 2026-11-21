@@ -71,6 +71,18 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
 }
 
+/**
+ * 脚底贴地所需的髋高。优先用后端平滑过的 `hipHeight`（原地动作不会上下抖），
+ * 只有推理进行中 / 该帧没有着地参考时才退回"当前帧最低脚"。
+ */
+function resolveHipHeight(frame: PreviewFrame, joints: JointMap): number {
+  const backend = frame.hipHeight
+  if (typeof backend === 'number' && Number.isFinite(backend) && backend > 0) {
+    return clamp(backend, 0.45, 1.25)
+  }
+  return groundedHipHeightFromJoints(joints)
+}
+
 function smoothUnion(a: number, b: number): number {
   const high = Math.max(a, b)
   const low = Math.min(a, b)
@@ -91,9 +103,10 @@ function addFieldBall(
   const field = surface.field
   const palette = surface.palette
   const size = surface.size
-  const invRadiusSquared = 4 / (radius * radius)
-  // MarchingCubes 的 field 坐标是 [-1,1]，而球的输入半径是世界米数（对应 [-0.5,0.5]）。
-  const extent = (radius / 2) * FIELD_CUTOFF_RADIUS
+  // field 坐标与关节坐标同为 [-1,1] 的世界坐标：等值面正好落在 d = radius 上。
+  // 之前多除了一次 2，导致四肢只有标称粗细的一半，头/手（解析几何）却按原尺寸画，比例失衡。
+  const invRadiusSquared = 1 / (radius * radius)
+  const extent = radius * FIELD_CUTOFF_RADIUS
   const minX = clamp(Math.floor((point.x - extent + 1) * size * 0.5), 0, size - 1)
   const maxX = clamp(Math.ceil((point.x + extent + 1) * size * 0.5), 0, size - 1)
   const minY = clamp(Math.floor((point.y - extent + 1) * size * 0.5), 0, size - 1)
@@ -410,7 +423,7 @@ export function ThreeMeshPreview({ frame, showGrid, theme }: ThreeMeshPreviewPro
     refs.lastFrameTime = frame.t
     refs.pending = {
       joints: refs.smoothed,
-      hipHeight: groundedHipHeightFromJoints(refs.smoothed),
+      hipHeight: resolveHipHeight(frame, refs.smoothed),
       fingers: {
         left: readFingerChains(frame, 'left'),
         right: readFingerChains(frame, 'right'),

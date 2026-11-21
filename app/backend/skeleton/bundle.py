@@ -58,7 +58,8 @@ class SkeletonConfig(BaseModel):
     normalize_root_at_start: bool = True
     anchor_feet_to_ground: bool = Field(
         True,
-        description="按脚踝/脚尖着地锚定地面，恢复 world 模式下被髋原点抹掉的下蹲下沉",
+        description="按脚踝/脚尖着地锚定地面：恢复 world 模式下被髋原点抹掉的下蹲下沉，"
+        "并把支撑脚钉在平滑后的地面高度上（原地动作时脚不会随关键点噪声上下跳）",
     )
 
 
@@ -125,10 +126,9 @@ def build_skeleton_bundle(
     world = map_frames(ordered, use_world=True, **map_kwargs)
     converted = convert_frames(world)
     ground_references: list[GroundReference] = []
+    ground_config = GroundContactConfig()
     if config.anchor_feet_to_ground:
-        converted, ground_references = anchor_feet_to_ground(
-            converted, GroundContactConfig()
-        )
+        converted, ground_references = anchor_feet_to_ground(converted, ground_config)
     root_motion = build_root_motion(
         converted,
         RootMotionConfig(
@@ -144,6 +144,22 @@ def build_skeleton_bundle(
             f"估计站立参考腿长 {reference.foot_span_meters:.2f} m，"
             "world 模式的 root.y 已恢复下蹲时的髋部下沉（脚底保持在地面）"
         )
+        if (
+            reference.span_jitter_before_meters > 0
+            and ground_config.smooth_cutoff_hz > 0
+        ):
+            notes.append(
+                f"支撑脚跨度已做 {ground_config.smooth_cutoff_hz:.1f} Hz 零相位高斯低通 + "
+                f"{ground_config.switch_margin_meters * 100:.0f} cm 支撑脚切换滞回："
+                f"逐帧抖动 {reference.span_jitter_before_meters * 100:.1f} cm → "
+                f"{reference.span_jitter_after_meters * 100:.1f} cm，"
+                "原地动作的髋部上下抖动随之被压掉"
+            )
+        if ground_config.lock_support_foot:
+            notes.append(
+                "支撑脚已按平滑后的跨度锁定（两骨 IK 重排膝，骨长不变）："
+                "脚底高度在整段里恒定，不再随关键点噪声离地/落地"
+            )
     if not has_world:
         notes.append(
             "当前引擎没有输出 world landmarks（米制世界坐标），3D 关节为空；"

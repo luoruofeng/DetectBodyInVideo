@@ -38,11 +38,23 @@ const MAX_FOOT_SPAN = 1.3
 
 /**
  * 关节是髋局部坐标，髋本身恒在原点。直接渲染会让深蹲时脚踝随膝弯曲上移，
- * 看起来像双脚离地。这里取最低可见脚的跨度作为髋到地面的高度：
- * 下蹲时跨度变小 → 髋下沉，脚底始终贴在 y=0 的网格上。
+ * 看起来像双脚离地，所以要把髋放到"脚底高度"上。
+ *
+ * 优先用后端给的 `hipHeight`：它对支撑脚跨度做过零相位平滑，原地动作时不会
+ * 因为逐帧关键点噪声让整个身体上下抖。只有推理进行中（没有后处理结果）才退回
+ * "取当前帧最低脚"的旧算法 —— 那条路径会把噪声原样画出来。
  */
 function groundedHipHeight(frame: PreviewFrame | null): number {
   if (!frame) return HIP_HEIGHT
+  const backend = frame.hipHeight
+  if (
+    typeof backend === 'number' &&
+    Number.isFinite(backend) &&
+    backend >= MIN_FOOT_SPAN &&
+    backend <= MAX_FOOT_SPAN
+  ) {
+    return backend
+  }
   let lowest = Infinity
   for (const name of FOOT_JOINTS) {
     const joint = frame.joints[name]

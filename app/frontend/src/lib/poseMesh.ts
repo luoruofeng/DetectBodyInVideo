@@ -26,11 +26,11 @@ const WHITE = 0xf8fbff
 const REFERENCE_STATURE = 1.9
 
 /**
- * 腰腹半宽（米，1.9m 基准）。两条大腿的直径之和明显小于腰宽：
- * 单腿半径取 0.048，两条合计不足腰宽，中间留出自然的裆部间隙。
+ * 腰腹半宽与大腿半径（米，1.9m 基准）。两条大腿的直径之和小于腰宽，
+ * 中间留出自然的裆部间隙；数值与 ThreeMeshPreview 的标量场半径一一对应。
  */
-const WAIST_HALF_WIDTH = 0.125
-const UPPER_THIGH_RADIUS = 0.048
+const WAIST_HALF_WIDTH = 0.15
+const UPPER_THIGH_RADIUS = 0.065
 
 /** 髋局部坐标下的兜底姿态；仅用于补齐缺失关节，避免曲面断裂。 */
 const REST_JOINTS: Record<string, Vec3Tuple> = {
@@ -263,11 +263,11 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
   const s = estimateBodyScale(joints)
   const { up, lateral, front } = bodyBasis(joints)
   const shoulderSpan = leftShoulder.distanceTo(rightShoulder)
-  // 胸宽取肩宽约 0.38 倍（再除以体格缩放，避免与 addBall 的 s 重复放大）。
-  const chestHalf = clamp((shoulderSpan / s) * 0.38, 0.13, 0.175)
+  // 胸宽取肩宽约 0.42 倍（再除以体格缩放，避免与 addBall 的 s 重复放大）。
+  const chestHalf = clamp((shoulderSpan / s) * 0.42, 0.15, 0.19)
   // 髋横轴优先取两髋连线（投影到骨盆平面），比肩线更贴近下半身的实际朝向。
   const hipAxis = projectedAxis(rightHip, leftHip, up, lateral)
-  const hipSocketRadius = UPPER_THIGH_RADIUS * 0.98
+  const hipSocketRadius = UPPER_THIGH_RADIUS * 0.96
   const kneeRadius = UPPER_THIGH_RADIUS * 0.78
 
   const addBall = (point: THREE.Vector3, radius: number, color = WHITE) => {
@@ -307,11 +307,33 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
     addBall(center, depth)
     const spread = halfWidth - depth
     if (spread <= 1e-4) return
-    for (const ratio of [0.5, 1]) {
+    // 横向多铺几层，横截面从“五球拼接”变成近似连续的椭圆，胸口不会再出现折痕。
+    for (const ratio of [0.25, 0.5, 0.75, 1]) {
       const offset = spread * ratio
       addBall(center.clone().addScaledVector(lateral, offset), depth)
       addBall(center.clone().addScaledVector(lateral, -offset), depth)
     }
+  }
+
+  /** 在关键横截面之间插值铺层，避免六个离散截面把躯干切成一圈圈“游泳圈”。 */
+  const addTorso = (
+    sections: { center: THREE.Vector3; halfWidth: number; halfDepth: number }[],
+  ) => {
+    for (let i = 0; i < sections.length - 1; i += 1) {
+      const from = sections[i]
+      const to = sections[i + 1]
+      const steps = Math.max(1, Math.ceil(from.center.distanceTo(to.center) / 0.028))
+      for (let step = 0; step < steps; step += 1) {
+        const k = step / steps
+        addTorsoRow(
+          from.center.clone().lerp(to.center, k),
+          from.halfWidth + (to.halfWidth - from.halfWidth) * k,
+          from.halfDepth + (to.halfDepth - from.halfDepth) * k,
+        )
+      }
+    }
+    const last = sections[sections.length - 1]
+    addTorsoRow(last.center, last.halfWidth, last.halfDepth)
   }
 
   /**
@@ -327,8 +349,8 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
 
     // 踝关节到脚底的高度由踝/脚尖高差推出来，并夹在人体比例的合理区间。
     const reach = ankle.distanceTo(toes) * s
-    const toeTip = clamp(reach, 0.11 * s, 0.18 * s) + 0.02 * s
-    const heel = -0.05 * s
+    const toeTip = clamp(reach, 0.12 * s, 0.19 * s) + 0.02 * s
+    const heel = -0.055 * s
     // 脚底比最低的踝/脚尖关节再低 5 mm：贴地又不至于把脚陷进地面网格里。
     const soleDrop = clamp(ankle.dot(up) - toes.dot(up) + 0.005, 0.035, 0.085)
 
@@ -346,29 +368,31 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
     const segments = Math.max(4, Math.ceil((toeTip - heel) / (0.026 * s)))
     for (let i = 0; i <= segments; i += 1) {
       const k = i / segments
-      addSoleBall(heel + (toeTip - heel) * k, 0.038 - 0.013 * k ** 1.6)
+      addSoleBall(heel + (toeTip - heel) * k, 0.046 - 0.016 * k ** 1.6)
     }
   }
 
   // ── 骨盆、腰腹与胸腔 ──────────────────────────────────────────
   // 逐层铺扁平横截面：髋宽 > 腰宽 < 胸宽，前后厚度始终小于横向宽度。
-  addTorsoRow(hips.clone().addScaledVector(up, -0.012), 0.14, 0.086)
-  addTorsoRow(hips.clone().addScaledVector(up, 0.09), WAIST_HALF_WIDTH * 1.02, 0.074)
-  addTorsoRow(spine3, WAIST_HALF_WIDTH, 0.072)
-  addTorsoRow(spine3.clone().lerp(spine7, 0.55), 0.135, 0.08)
-  addTorsoRow(spine7.clone().addScaledVector(up, -0.02), chestHalf, 0.09)
-  addTorsoRow(spine7.clone().addScaledVector(up, 0.07), chestHalf * 0.98, 0.084)
+  addTorso([
+    { center: hips.clone().addScaledVector(up, -0.012), halfWidth: 0.17, halfDepth: 0.102 },
+    { center: hips.clone().addScaledVector(up, 0.09), halfWidth: WAIST_HALF_WIDTH, halfDepth: 0.09 },
+    { center: spine3, halfWidth: WAIST_HALF_WIDTH * 0.98, halfDepth: 0.086 },
+    { center: spine3.clone().lerp(spine7, 0.55), halfWidth: 0.16, halfDepth: 0.096 },
+    { center: spine7.clone().addScaledVector(up, -0.02), halfWidth: chestHalf, halfDepth: 0.105 },
+    { center: spine7.clone().addScaledVector(up, 0.07), halfWidth: chestHalf * 0.98, halfDepth: 0.098 },
+  ])
 
   // ── 肩带与颈 ─────────────────────────────────────────────────
-  addLimb(spine7.clone().addScaledVector(up, 0.07), neck, 0.078, 0.05)
-  addLimb(leftShoulder, rightShoulder, 0.046, 0.046)
-  addLimb(neck, leftShoulder, 0.04, 0.056)
-  addLimb(neck, rightShoulder, 0.04, 0.056)
+  addLimb(spine7.clone().addScaledVector(up, 0.07), neck, 0.09, 0.062)
+  addLimb(leftShoulder, rightShoulder, 0.052, 0.052)
+  addLimb(neck, leftShoulder, 0.05, 0.064)
+  addLimb(neck, rightShoulder, 0.05, 0.064)
 
   // ── 颈 ────────────────────────────────────────────────────────
   // 头颅由 bodyParts 的椭球生成（球堆在 96³ 网格上只会堆出一颗畸形的脑袋），
   // 这里只留一截脖子，末端球与颅底重叠，衔接处不会露缝。
-  addLimb(neck, head, 0.042, 0.040)
+  addLimb(neck, head, 0.058, 0.052)
 
   for (const side of SIDES) {
     // ── 手臂 ────────────────────────────────────────────────────
@@ -377,13 +401,13 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
     const forearm = get(`${side}_forearm_joint`)
     const hand = get(`${side}_hand_joint`)
 
-    addBall(shoulder, 0.058)
-    addLimb(shoulder, elbow, 0.05, 0.041)
-    addBall(elbow, 0.041)
-    addLimb(elbow, forearm, 0.041, 0.034)
-    addLimb(forearm, hand, 0.034, 0.026)
+    addBall(shoulder, 0.066)
+    addLimb(shoulder, elbow, 0.058, 0.047)
+    addBall(elbow, 0.047)
+    addLimb(elbow, forearm, 0.047, 0.04)
+    addLimb(forearm, hand, 0.04, 0.032)
     // 手掌与五指由 bodyParts 的解析几何生成，这里只把前臂收在腕关节上。
-    addBall(hand, 0.026)
+    addBall(hand, 0.032)
 
     // ── 腿与脚 ──────────────────────────────────────────────────
     const hip = get(`${side}_upLeg_joint`)
@@ -395,14 +419,14 @@ export function buildMeshBalls(joints: JointMap): MeshBall[] {
     const sideSign = side === 'left' ? 1 : -1
     const root = thighRootPoint(hip, hips, hipAxis, up, sideSign, s, hip.distanceTo(knee) * 0.12)
     const socket = root.clone().addScaledVector(front, -0.008 * s).addScaledVector(up, 0.006 * s)
-    addLimb(hips, socket, WAIST_HALF_WIDTH * 0.55, hipSocketRadius)
+    addLimb(hips, socket, WAIST_HALF_WIDTH * 0.5, hipSocketRadius)
     addBall(socket, hipSocketRadius)
     addBall(socket.clone().addScaledVector(front, -0.012 * s), hipSocketRadius * 0.9)
 
     addLimb(root, knee, UPPER_THIGH_RADIUS, kneeRadius)
     addBall(knee, kneeRadius)
-    addLimb(knee, ankle, kneeRadius * 0.9, 0.029)
-    addBall(ankle, 0.03)
+    addLimb(knee, ankle, kneeRadius * 0.82, 0.038)
+    addBall(ankle, 0.038)
     addFoot(ankle, toes)
   }
 

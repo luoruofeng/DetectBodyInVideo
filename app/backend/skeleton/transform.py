@@ -66,6 +66,11 @@ class ConvertedFrame(BaseModel):
     track_id: int | None = None
     joints: dict[str, JointPosition] = Field(default_factory=dict)
     root: Vector3 = Field(default_factory=Vector3)
+    ground_span: float | None = Field(
+        None,
+        description="髋到最低着地点（踝/脚尖）的竖直距离（米，已做零相位平滑）。"
+        "只供预览把脚底放到地面上，不参与导出坐标；导出用的是 root 平移",
+    )
 
 
 def to_realitykit_vector(point: Vector3) -> Vector3:

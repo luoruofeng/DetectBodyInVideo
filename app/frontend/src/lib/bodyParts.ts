@@ -26,9 +26,9 @@ export type FingerChains = (THREE.Vector3[] | null)[]
 const PALM_NORMAL = new THREE.Vector3(0, 0, 1)
 
 /** 头颅椭球半径（米，1.9 m 成年人）：左右 / 上下 / 前后。 */
-const HEAD_RADIUS = { lateral: 0.077, vertical: 0.104, front: 0.092 }
+const HEAD_RADIUS = { lateral: 0.085, vertical: 0.125, front: 0.1 }
 /** 颅心相对 head_joint（耳线/鼻尖附近）的偏移：略高一点，下颌才不会缺一截。 */
-const HEAD_LIFT = 0.026
+const HEAD_LIFT = 0.03
 
 /** 指关节可信度门槛；低于它视为该手指这一帧没有数据。 */
 const HAND_JOINT_VISIBILITY = 0.05

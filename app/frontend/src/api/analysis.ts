@@ -178,6 +178,8 @@ export interface PreviewFrame {
   joints: Record<string, PreviewJoint>
   angles: Record<string, number>
   bbox: BoundingBox | null
+  /** 髋到最低着地点的竖直距离（米，后端已做零相位平滑）；预览直接用它把脚底放到地面 */
+  hipHeight?: number | null
 }
 
 export interface FramesPayload {

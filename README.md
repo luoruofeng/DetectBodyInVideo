@@ -749,7 +749,7 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 - 鼠标靠近关键点 14 px 内显示中文点位名、归一化 x/y/z 与置信度；检测框为青色虚线。
 - 关闭「骨架」后检测框也不会绘制；「编号」开关在窄屏隐藏但状态仍有效。
 - 骨架取「最后一个 `t <= currentTime`」的帧，不是绝对时间最近的帧；`valid=false` 时左下角提示「本帧无有效姿态（valid=false）」。
-- 3D 预览使用米制 ARKit 关节，跟随主题调整骨骼颜色，显示地面网格与坐标轴。
+- 3D 预览使用米制 ARKit 关节，跟随主题调整骨骼颜色，显示地面网格与坐标轴。髋高优先取后端 `PreviewFrame.hipHeight`（支撑脚跨度已做零相位平滑），只有推理进行中才退回"当前帧最低脚"，避免原地动作时整段身体被关键点噪声抖起来。
 
 ### 播放与时间轴
 
@@ -1467,6 +1467,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 | 基准结果看起来很好但不真实 | `stub` 只是链路自检；真实性能需用 `--engine auto|mediapipe|onnx` 重跑 |
 | 深度结果不可信 | 检查 `depthConfidence` 与 `warnings`；按侧面机位重拍；不要把 `z` 当绝对距离 |
 | 深蹲时脚离地、髋不下沉 | 已启用脚部着地锚定：3D 预览按脚尖贴地重定位髋，`world` 模式 `root.y` 也恢复下沉；若脚踝/脚尖长期被遮挡，锚定会跳过，可先用 `skeleton.anchor_feet_to_ground=false` 做 A/B 对比 |
+| 原地跳舞（脚没动）时双脚抖动、脚底没踩实 | 单目下肢关键点的逐帧噪声会经"脚部着地锚定"被放大成整段髋部上下抖动。现已在 `skeleton/ground.py` 里对支撑脚跨度做 3 Hz 零相位高斯低通（`GroundContactConfig.smooth_cutoff_hz`，0 = 关闭）、给左右支撑脚加 2 cm 切换滞回（`switch_margin_meters`），并用两骨 IK 把支撑脚钉在平滑后的地面高度上（`lock_support_foot`，骨长不变）；3D/白膜预览改用后端平滑后的髋高（`PreviewFrame.hipHeight`），不再逐帧取"最低脚"。若仍明显，优先改成正侧机位、提高下肢可见度（`DETECT_BODY_LOWER_LIMB_RETRY_VISIBILITY`）或换 `heavy` 档模型 |
 | 动作 JSON 无法还原腾空 | 单目 + 髋局部坐标只能靠着地假设还原下蹲下沉，腾空高度不可测 |
 | 左右与真实人物相反 | 源视频可能是自拍镜像；转码翻转画面或在 App 侧处理 `mirroredReference` |
 
@@ -1479,6 +1480,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 - `world` 模式下手指/面部关节无米制 world 观测，以姿态腕点/鼻点为锚按局部尺度估计；单目深度不可靠，指关节的前后方向仅作相对参考。
 - `mirroredReference` 固定为 `true`（与 App 样例一致）；自拍镜像需额外处理。
 - `pelvisOffsetMeters` 靠着地锚定只能还原下蹲 / 屈膝下沉，无法还原跳跃腾空。
+- 竖直方向（髋高、下蹲下沉）靠着地锚定 + 支撑脚跨度零相位低通得到；支撑脚还会被锁定在平滑后的地面高度上（单帧修正上限 `GroundContactConfig.max_foot_shift_meters`，默认 8 cm，膝由两骨 IK 重排、骨长不变），因此 `joints` 不是原始世界坐标的直接相减结果 —— 这是有意的：要让脚看起来真的踩在地上，就必须牺牲一点逐帧原始值。**水平方向**的脚部位置仍是髋局部坐标，髋左右摇摆时脚必然跟着摆，单目无法区分"脚在动"和"髋在动"，所以原地动作里脚仍可能有少量水平漂移。左右脚来回切换支撑脚造成的阶跃已由滞回 + 低通压掉。
 - ONNX 引擎只接受 COCO 17 点模型，不输出 `z` / world landmarks；多人能力只由文件名中的 `rtmo` 判断。
 - MediaPipe 引擎不直接使用其 VIDEO 模式的 `tracking_ids`；`track_id` 由 `perf/runner.py` 统一分配（单人恒为 1，多人 IoU 跟踪），后处理轨迹筛选照常生效；显式指定引擎失败也会自动降级到另一引擎。
 - 补帧只处理长度 ≤5 的内部缺口；片头片尾和长缺口保持 `valid=false`。`densify(stride>1)` 在末帧不对齐步长时可能漏掉末帧。
