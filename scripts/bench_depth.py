@@ -12,6 +12,12 @@
 6. ``sagittal_motion_share`` 四肢顺着镜头方向伸展的帧占比，是上面那个歧义能否被
    观测到的**拍摄期**判据（越高说明越该补拍侧视机位）。
 
+踢腿专项（``docs/todo-kick-depth-accuracy.md`` §1.3）：
+
+7. ``sign_accuracy`` 与人工标注（``--labels``）比对每根骨段 ``sign(Δz)`` 的正确率，
+   分别统计大腿 / 小腿 / 摆动腿 / 支撑腿；
+8. ``kick_sagittal_error_deg`` 与人工标注比对大腿抬起角、小腿屈曲角的 mean / p95 误差。
+
 用法：
 
     # 真实视频（走完整分析链路，指标在"后处理之后"的帧上统计）
@@ -25,6 +31,11 @@
 
     # A/B：关掉本次新增的处理，看指标是否真的变化
     python scripts/bench_depth.py --synthetic --no-ik-fit --no-z-smoothing
+
+    # 踢腿验收：三档深度后端 + 人工标注
+    python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 \\
+        --depth-sign --depth-sign-mode temporal \\
+        --labels samples/benchmark/kick-labels.json --json out/bm05-temporal.json
 """
 
 from __future__ import annotations
@@ -66,7 +77,15 @@ REGRESSION_LIMITS: dict[str, float] = {
     "angle_drift_deg": 0.15,
     "depth_sign_flips": 0.30,
     "sagittal_motion_share": 0.30,
+    "sign_accuracy": 0.10,
+    "kick_sagittal_error_thigh_mean_deg": 0.20,
+    "kick_sagittal_error_shank_mean_deg": 0.20,
 }
+
+# 这些指标"越大越好"，判定方向要反过来（否则符号准确率上升会被标成劣化）
+HIGHER_IS_BETTER: frozenset[str] = frozenset(
+    {"sign_accuracy", "sign_accuracy_thigh", "sign_accuracy_shank"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +333,218 @@ def sagittal_motion_share(
     return round(_share(frames, aspect=aspect, threshold=threshold), 4)
 
 
+# --------------------------------------------------------------------------- #
+# 踢腿专项：人工标注真值（§1.2 / §1.3）
+# --------------------------------------------------------------------------- #
+# 标注文件契约（``samples/benchmark/kick-labels.json``）：
+#
+#   {
+#     "video": "BM-06-side-full.mp4",
+#     "fps": 30,
+#     "swingLeg": "left",
+#     "frames": [
+#       {"index": 0, "thighDeg": 8.0, "shankDeg": 3.0,
+#        "signs": {"left_knee": -1, "left_ankle": -1},
+#        "phase": "start"},
+#       ...
+#     ],
+#     "phases": {"start": 0, "peak": 18, "return": 34}
+#   }
+#
+# - ``thighDeg``：大腿在矢状面内相对"竖直向下"的抬起角（0 = 站立，90 = 水平前抬）；
+# - ``shankDeg``：小腿相对大腿延长线的屈曲角（0 = 伸直，正值 = 屈膝）；
+# - ``signs``：该帧每根骨段 ``sign(Δz)`` 的真值，**-1 = 子关节更靠近镜头**（踢向前方）；
+# - ``phases``：踢腿相位帧号（供 §5.3 的相位检测对比）。
+
+LEG_KEYS: dict[str, dict[str, str]] = {
+    "left": {"hip": "left_hip", "knee": "left_knee", "ankle": "left_ankle"},
+    "right": {"hip": "right_hip", "knee": "right_knee", "ankle": "right_ankle"},
+}
+
+
+def load_labels(path: Path | str) -> dict[str, Any]:
+    """读标注文件；缺文件时抛 ``SystemExit``（基准脚本宁可报错也不静默跳过真值）。"""
+    label_path = Path(path)
+    if not label_path.is_file():
+        raise SystemExit(f"找不到标注文件：{label_path}")
+    return json.loads(label_path.read_text(encoding="utf-8"))
+
+
+def sagittal_angles(frame: PoseFrame, side: str) -> tuple[float, float] | None:
+    """返回 ``(大腿抬起角, 小腿屈曲角)``，度。委托生产实现，保证基准与链路同口径。"""
+    from app.backend.postprocess.swing import sagittal_angles as _angles
+
+    return _angles(frame, side)
+
+
+def bone_signs(frame: PoseFrame, side: str) -> dict[str, int]:
+    """该侧大腿（膝）与小腿（踝）的 ``sign(Δz)``，键与标注文件的 ``signs`` 一致。"""
+    keys = LEG_KEYS.get(side)
+    if keys is None:
+        return {}
+    positions = node_positions(frame)
+    result: dict[str, int] = {}
+    for child, parent in ((keys["knee"], keys["hip"]), (keys["ankle"], keys["knee"])):
+        child_point = positions.get(child)
+        parent_point = positions.get(parent)
+        if child_point is None or parent_point is None:
+            continue
+        dz = float(child_point[2] - parent_point[2])
+        if abs(dz) < 1e-4:
+            continue
+        result[child] = 1 if dz > 0 else -1
+    return result
+
+
+def _label_frames(labels: dict[str, Any]) -> list[dict[str, Any]]:
+    frames = labels.get("frames")
+    return [item for item in frames if isinstance(item, dict)] if isinstance(frames, list) else []
+
+
+def sign_accuracy(
+    frames: Sequence[PoseFrame], labels: dict[str, Any]
+) -> dict[str, Any]:
+    """``sign(Δz)`` 与标注一致的样本占比，分别统计大腿 / 小腿 / 摆动腿 / 支撑腿。
+
+    统计对象是**后处理之后、即将导出的帧**（而不是中间产物），因为消费方看到的
+    就是这份结果：符号判错的直接后果就是"腿朝反方向踢"。
+    """
+    swing = str(labels.get("swingLeg") or "left").lower()
+    if swing not in LEG_KEYS:
+        swing = "left"
+    by_index = {frame.index: frame for frame in frames if frame.valid}
+
+    groups: dict[str, list[int]] = {
+        "thigh": [0, 0],
+        "shank": [0, 0],
+        "swingLeg": [0, 0],
+        "supportLeg": [0, 0],
+        "overall": [0, 0],
+    }
+    per_segment: dict[str, list[int]] = {}
+
+    for item in _label_frames(labels):
+        index = item.get("index")
+        truth = item.get("signs")
+        if not isinstance(index, int) or not isinstance(truth, dict):
+            continue
+        frame = by_index.get(index)
+        if frame is None:
+            continue
+        for side in LEG_KEYS:
+            observed = bone_signs(frame, side)
+            for key, expected in truth.items():
+                if key not in observed or not isinstance(expected, int) or expected == 0:
+                    continue
+                hit = 1 if observed[key] == expected else 0
+                group = "thigh" if key.endswith("knee") else "shank"
+                groups[group][0] += hit
+                groups[group][1] += 1
+                groups["swingLeg" if side == swing else "supportLeg"][0] += hit
+                groups["swingLeg" if side == swing else "supportLeg"][1] += 1
+                groups["overall"][0] += hit
+                groups["overall"][1] += 1
+                bucket = per_segment.setdefault(key, [0, 0])
+                bucket[0] += hit
+                bucket[1] += 1
+
+    def _ratio(pair: list[int]) -> float | None:
+        return round(pair[0] / pair[1], 4) if pair[1] else None
+
+    result: dict[str, Any] = {
+        "samples": groups["overall"][1],
+        "overall": _ratio(groups["overall"]),
+        "byGroup": {
+            key: _ratio(value) for key, value in groups.items() if key != "overall"
+        },
+        "bySegment": {key: _ratio(value) for key, value in sorted(per_segment.items())},
+        "swingLeg": swing,
+    }
+    return result if groups["overall"][1] else {}
+
+
+def kick_sagittal_error_deg(
+    frames: Sequence[PoseFrame], labels: dict[str, Any]
+) -> dict[str, Any]:
+    """大腿抬起角 / 小腿屈曲角与标注的绝对误差（mean / p95，度）。"""
+    swing = str(labels.get("swingLeg") or "left").lower()
+    if swing not in LEG_KEYS:
+        swing = "left"
+    by_index = {frame.index: frame for frame in frames if frame.valid}
+    errors: dict[str, list[float]] = {"thigh": [], "shank": []}
+
+    for item in _label_frames(labels):
+        index = item.get("index")
+        if not isinstance(index, int):
+            continue
+        frame = by_index.get(index)
+        if frame is None:
+            continue
+        angles = sagittal_angles(frame, swing)
+        if angles is None:
+            continue
+        for name, estimate, key in (
+            ("thigh", angles[0], "thighDeg"),
+            ("shank", angles[1], "shankDeg"),
+        ):
+            truth = item.get(key)
+            if not isinstance(truth, (int, float)):
+                continue
+            errors[name].append(abs(float(estimate) - float(truth)))
+
+    def _summary(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {"mean": 0.0, "p95": 0.0}
+        array = np.asarray(values, dtype=np.float64)
+        return {
+            "mean": round(float(array.mean()), 3),
+            "p95": round(float(np.percentile(array, 95)), 3),
+        }
+
+    if not errors["thigh"] and not errors["shank"]:
+        return {}
+    return {
+        "swingLeg": swing,
+        "frames": max(len(errors["thigh"]), len(errors["shank"])),
+        "thigh": _summary(errors["thigh"]),
+        "shank": _summary(errors["shank"]),
+    }
+
+
+def kick_phase_error(
+    frames: Sequence[PoseFrame],
+    labels: dict[str, Any],
+    *,
+    detected_phases: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """踢腿相位检测（§5.3）与标注相位的帧差；检测不可用或失败时返回空。
+
+    ``detected_phases`` 优先用链路自己给出的相位（基于**平滑前**的 2D 轨迹）。
+    在输出帧上重算会把平滑带来的 4~5 帧滞后记到检测头上，指标就失去意义了。
+    """
+    truth = labels.get("phases")
+    if not isinstance(truth, dict) or not truth:
+        return {}
+    if detected_phases:
+        detected_phases = {key: int(value) for key, value in detected_phases.items()}
+    else:
+        try:
+            from app.backend.postprocess.swing import detect_kick_phases
+
+            detected_phases = detect_kick_phases(frames).phases
+        except Exception:  # pragma: no cover - 模块缺失/检测失败都不影响基准
+            return {}
+    result: dict[str, Any] = {}
+    for key, frame_index in truth.items():
+        estimated = detected_phases.get(key)
+        if not isinstance(frame_index, int) or estimated is None:
+            continue
+        result[key] = abs(int(estimated) - int(frame_index))
+    if not result:
+        return {}
+    return {"frameError": result, "maxFrameError": max(result.values())}
+
+
 def reprojection_summary(
     frames: Sequence[PoseFrame], *, aspect: float, width: float, height: float
 ) -> dict[str, float]:
@@ -361,6 +592,46 @@ def _synthetic_frames(
     return frames, 1080, 1920, fps
 
 
+def _synthetic_kick_frames(
+    peak_deg: float = 80.0, z_noise: float = 0.0, corrupt: bool = False
+) -> tuple[list[PoseFrame], int, int, float, dict[str, Any]]:
+    """合成"前踢腿"序列 + 同源真值标注（没有真实素材时的替代基线）。
+
+    真值来自**投影前的 3D 骨架**，因此 ``sign_accuracy`` / 矢状面角误差在这里
+    是物理上有意义的数字，而不是"自己和自己比"。``corrupt=True`` 会按真实故障形态
+    把部分帧的腿整体镜像（2D 与骨长都不变、只有 Δz 反号），用来验证指标能否抓到
+    "腿翻面"。
+    """
+    tests_dir = PROJECT_ROOT / "tests"
+    if str(tests_dir) not in sys.path:
+        sys.path.insert(0, str(tests_dir))
+    import synth_pose
+
+    fps = 30.0
+    # 三角速度剖面（没有平台段）：相位唯一，才能用"帧差"验收 §5.3 的检测精度
+    frames = synth_pose.make_kick_frames(60, peak_deg=peak_deg, fps=fps, ramp=0.5)
+    labels = synth_pose.kick_labels(frames)
+    if z_noise > 0:
+        frames = synth_pose.add_depth_noise(frames, z_sigma=z_noise, xy_sigma=z_noise * 0.3)
+    if corrupt:
+        from app.backend.engine.base import (
+            LEFT_ANKLE,
+            LEFT_FOOT_INDEX,
+            LEFT_HEEL,
+            LEFT_HIP,
+            LEFT_KNEE,
+        )
+
+        for position, frame in enumerate(frames):
+            if position % 7 != 3:
+                continue
+            hip_z = frame.world_landmarks[LEFT_HIP].z
+            for index in (LEFT_KNEE, LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX):
+                point = frame.world_landmarks[index]
+                point.z = 2.0 * hip_z - point.z
+    return frames, 1080, 1920, fps, labels
+
+
 def _analyze(
     path: Path, options: Any
 ) -> tuple[list[PoseFrame], int, int, float, dict[str, Any]]:
@@ -377,6 +648,10 @@ def _analyze(
         "verdict": result.postprocess.quality.verdict,
         "fitMsPerFrame": getattr(fit, "milliseconds_per_frame", None),
         "depthSignApplied": result.postprocess.depth_sign.applied,
+        "depthSignMode": result.postprocess.depth_sign.mode,
+        "swingLeg": getattr(result.postprocess, "swing", None)
+        and result.postprocess.swing.swing_leg,
+        "kickPhases": dict(getattr(result.postprocess.kick_phases, "phases", {}) or {}),
     }
     return (
         result.postprocess.frames,
@@ -397,8 +672,16 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
 
     postprocess = PostProcessConfig(stride=stride, fps=fps)
     if hasattr(postprocess, "ik_fit"):
+        fit_update: dict[str, Any] = {"enabled": not args.no_ik_fit}
+        # §4 的权重扫描：0 = 只有符号（hinge），>0 才启用方向向量先验
+        direction_weight = getattr(args, "direction_weight", 0.0)
+        if direction_weight and hasattr(postprocess.ik_fit, "depth_direction_weight"):
+            fit_update["depth_direction_weight"] = float(direction_weight)
+        sparsity = getattr(args, "direction_sparsity", 0.0)
+        if sparsity and hasattr(postprocess.ik_fit, "depth_sparsity_weight"):
+            fit_update["depth_sparsity_weight"] = float(sparsity)
         postprocess = postprocess.model_copy(
-            update={"ik_fit": postprocess.ik_fit.model_copy(update={"enabled": not args.no_ik_fit})}
+            update={"ik_fit": postprocess.ik_fit.model_copy(update=fit_update)}
         )
 
     smoothing = postprocess.smoothing
@@ -413,16 +696,86 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
         smoothing = smoothing.model_copy(update=updates)
     if args.no_smoothing:
         smoothing = smoothing.model_copy(update={"method": "none"})
+    mode = getattr(args, "depth_sign_mode", None)
     if getattr(args, "depth_sign", False) and hasattr(postprocess, "depth_sign"):
+        update: dict[str, Any] = {"enabled": True}
+        # §1.4 的三档基线必须能选 ``model``，否则"temporal vs model"根本采不出来。
+        # 这里显式写 mode（即使等于默认值）会被 ``pipeline.py`` 的合并规则覆盖，
+        # 所以顺带把服务级配置也钉住（见 ``_pin_settings_for_run``）。
+        if mode:
+            update["mode"] = mode
         postprocess = postprocess.model_copy(
-            update={"depth_sign": postprocess.depth_sign.model_copy(update={"enabled": True})}
+            update={"depth_sign": postprocess.depth_sign.model_copy(update=update)}
+        )
+    elif mode and hasattr(postprocess, "depth_sign"):
+        postprocess = postprocess.model_copy(
+            update={"depth_sign": postprocess.depth_sign.model_copy(update={"mode": mode})}
         )
     return postprocess.model_copy(update={"smoothing": smoothing})
 
 
+def _pin_settings_for_run(args: argparse.Namespace) -> None:
+    """把 ``--depth-sign-mode`` / ``--lifter`` 钉到服务级配置上。
+
+    ``pipeline.py`` 的合并规则是"前端传的 mode 等于默认值 temporal 时用 settings 覆盖"，
+    基准脚本直接构造配置，等于前端传默认值 —— 不钉住 settings 就选不到 ``model``。
+    """
+    import os
+
+    changed = False
+    mode = getattr(args, "depth_sign_mode", None)
+    if mode:
+        os.environ["DETECT_BODY_DEPTH_SIGN_MODE"] = mode
+        changed = True
+    lifter = getattr(args, "lifter", None)
+    if lifter:
+        os.environ["DETECT_BODY_LIFTER"] = lifter
+        changed = True
+    if getattr(args, "depth_sign", False):
+        os.environ["DETECT_BODY_DEPTH_SIGN_ENABLED"] = "1"
+        changed = True
+    if changed:
+        from app.backend.core.settings import reset_settings_cache
+
+        reset_settings_cache()
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     timing: dict[str, Any] = {}
-    if args.synthetic:
+    generated_labels: dict[str, Any] | None = None
+    if getattr(args, "synthetic_kick", False):
+        frames, width, height, fps, generated_labels = _synthetic_kick_frames(
+            peak_deg=getattr(args, "kick_peak", 80.0),
+            z_noise=getattr(args, "kick_noise", 0.0),
+            corrupt=getattr(args, "corrupt_signs", False),
+        )
+        from app.backend.postprocess.pipeline import run_postprocess
+
+        started = time.perf_counter()
+        postprocess = run_postprocess(
+            frames, build_postprocess_config(args, stride=1, fps=fps)
+        )
+        elapsed = time.perf_counter() - started
+        frames = postprocess.frames
+        fit = getattr(postprocess, "fit", None)
+        extra = {
+            "engine": "synthetic-kick",
+            "engineDisplayName": "确定性合成前踢腿（tests/synth_pose.py）",
+            "verdict": postprocess.quality.verdict,
+            "fitMsPerFrame": getattr(fit, "milliseconds_per_frame", None),
+            "depthSignApplied": postprocess.depth_sign.applied,
+            "depthSignMode": postprocess.depth_sign.mode,
+            "swingLeg": getattr(postprocess, "swing", None)
+            and postprocess.swing.swing_leg,
+            # 相位由链路自己给出（基于平滑前的 2D 轨迹），不要在输出帧上重算：
+            # 平滑会把动作起点抹开 4~5 帧，重算等于把平滑滞后记到检测头上
+            "kickPhases": dict(getattr(postprocess.kick_phases, "phases", {}) or {}),
+        }
+        timing = {
+            "postprocessSeconds": round(elapsed, 4),
+            "framesPerSecond": round(len(frames) / elapsed, 2) if elapsed > 0 else 0.0,
+        }
+    elif args.synthetic:
         frames, width, height, fps = _synthetic_frames(args.z_noise, args.rotation)
         from app.backend.postprocess.pipeline import run_postprocess
 
@@ -463,12 +816,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     aspect = width / height if height else 9 / 16
     cv = bone_length_cv(frames)
+    labels = load_labels(args.labels) if getattr(args, "labels", "") else generated_labels
     metrics = {
-        "label": args.label or ("synthetic" if args.synthetic else Path(args.video).stem),
-        "source": "synthetic" if args.synthetic else str(args.video),
+        "label": args.label
+        or (
+            "synthetic-kick"
+            if getattr(args, "synthetic_kick", False)
+            else ("synthetic" if args.synthetic else Path(args.video).stem)
+        ),
+        "source": (
+            "synthetic-kick"
+            if getattr(args, "synthetic_kick", False)
+            else ("synthetic" if args.synthetic else str(args.video))
+        ),
         "resolution": f"{width}x{height}",
         "fps": round(fps, 3),
         "frames": len(frames),
+        "depth_sign_mode": getattr(args, "depth_sign_mode", None) or "off",
         "z_jitter": z_jitter(frames),
         "xy_jitter": xy_jitter(frames),
         "bone_length_cv": cv,
@@ -488,8 +852,56 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "ik_fit_enabled": not args.no_ik_fit,
         "yaw": yaw_comparison(frames, truth_deg=args.rotation if args.synthetic else None),
     }
+    if labels is not None:
+        metrics["labels"] = str(args.labels) if getattr(args, "labels", "") else "generated:synthetic-kick"
+        metrics["sign_accuracy"] = sign_accuracy(frames, labels)
+        metrics["kick_sagittal_error_deg"] = kick_sagittal_error_deg(frames, labels)
+        metrics["kick_phase_error"] = kick_phase_error(
+            frames, labels, detected_phases=extra.get("kickPhases")
+        )
     metrics.update({f"info_{key}": value for key, value in extra.items()})
+    if getattr(args, "write_labels", ""):
+        draft = _label_draft(
+            frames,
+            labels=labels,
+            video="synthetic-kick" if getattr(args, "synthetic_kick", False) else Path(args.video).name,
+        )
+        target = Path(args.write_labels)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(draft, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"\n标注草稿已写入 {target}（status={draft.get('status')}，需人工修正后使用）")
     return metrics
+
+
+def _label_draft(
+    frames: Sequence[PoseFrame], *, labels: dict[str, Any] | None, video: str
+) -> dict[str, Any]:
+    """生成标注草稿：先跑一遍链路，再人工修正（§1.2 允许的半自动流程）。
+
+    角度与符号都来自**本次输出**，所以它是"待修正的草稿"而不是真值 ——
+    ``status`` 字段写明这一点，避免后来的人把它当真值用。
+    """
+    if labels is not None and labels.get("frames"):
+        draft = dict(labels)
+        draft.setdefault("status", "generated")
+        draft["video"] = video
+        return draft
+
+    tests_dir = PROJECT_ROOT / "tests"
+    if str(tests_dir) not in sys.path:
+        sys.path.insert(0, str(tests_dir))
+    import synth_pose
+
+    from app.backend.postprocess.swing import identify_swing_leg
+
+    side = identify_swing_leg(frames).swing_leg
+    draft = synth_pose.kick_labels(frames, side="right" if side == "right" else "left")
+    draft["video"] = video
+    draft["status"] = "auto-draft"
+    draft["note"] = (
+        "自动草稿：角度与符号来自本次分析输出，逐帧人工核对后把 status 改为 annotated 再当真值用"
+    )
+    return draft
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +928,23 @@ def _flat(metrics: dict[str, Any]) -> dict[str, float]:
     ):
         if yaw.get(source) is not None:
             flat[key] = float(yaw[source])
+    # 踢腿专项：只有提供了 --labels 才有数字（没标注就没有真值，宁可缺项也不填 0）
+    accuracy = metrics.get("sign_accuracy") or {}
+    if accuracy.get("overall") is not None:
+        flat["sign_accuracy"] = float(accuracy["overall"])
+    for group in ("thigh", "shank", "swingLeg", "supportLeg"):
+        value = (accuracy.get("byGroup") or {}).get(group)
+        if value is not None:
+            flat[f"sign_accuracy_{group}"] = float(value)
+    sagittal = metrics.get("kick_sagittal_error_deg") or {}
+    for joint in ("thigh", "shank"):
+        block = sagittal.get(joint) or {}
+        if block:
+            flat[f"kick_sagittal_error_{joint}_mean_deg"] = float(block.get("mean", 0.0))
+            flat[f"kick_sagittal_error_{joint}_p95_deg"] = float(block.get("p95", 0.0))
+    phase = metrics.get("kick_phase_error") or {}
+    if phase.get("maxFrameError") is not None:
+        flat["kick_phase_max_frame_error"] = float(phase["maxFrameError"])
     return flat
 
 
@@ -538,7 +967,8 @@ def print_table(metrics: dict[str, Any], baseline: dict[str, Any] | None = None)
             limit = REGRESSION_LIMITS.get(key)
             verdict = "—"
             if limit is not None and previous > 1e-12:
-                verdict = "劣化" if ratio > limit * 100 else "ok"
+                worse = ratio < -limit * 100 if key in HIGHER_IS_BETTER else ratio > limit * 100
+                verdict = "劣化" if worse else "ok"
             row += f"{previous:>12.5f}{ratio:>11.1f}%{verdict:>8}"
         print(row)
     if metrics.get("timing"):
@@ -552,6 +982,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="深度（Z 轴）精度基准")
     parser.add_argument("video", nargs="?", help="待测视频；配合 --synthetic 时可省略")
     parser.add_argument("--synthetic", action="store_true", help="用确定性合成姿态序列，不需要模型")
+    parser.add_argument(
+        "--synthetic-kick",
+        action="store_true",
+        help="用确定性合成的「前踢腿」序列（含同源真值标注），可在无素材时验证符号准确率与矢状面角误差",
+    )
+    parser.add_argument(
+        "--kick-peak",
+        type=float,
+        default=80.0,
+        help="合成踢腿的最大抬腿角（度），默认 80",
+    )
+    parser.add_argument(
+        "--kick-noise",
+        type=float,
+        default=0.0,
+        help="合成踢腿模式下给 world z 叠加的高斯噪声（米），默认 0（纯几何真值）",
+    )
+    parser.add_argument(
+        "--corrupt-signs",
+        action="store_true",
+        help="合成踢腿模式下按真实故障形态镜像部分帧（2D 与骨长不变、只有 Δz 反号），"
+        "用来确认指标能抓到「腿翻面」",
+    )
     parser.add_argument(
         "--z-noise",
         type=float,
@@ -576,7 +1029,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="开启深度符号先验（时序一致性），对比 depth_sign_flips 前后的变化",
     )
+    parser.add_argument(
+        "--depth-sign-mode",
+        default="",
+        choices=["", "temporal", "model"],
+        help="符号先验后端（§1.3 前置）：temporal 零依赖 / model 需 ONNX 权重；"
+        "给出时自动开启 --depth-sign",
+    )
+    parser.add_argument(
+        "--lifter",
+        default="",
+        choices=["", "videopose3d", "motionbert", "agformer"],
+        help="抬升器后端（§3.3 的 A/B）：写入 DETECT_BODY_LIFTER，决定搜哪个 ONNX 权重",
+    )
+    parser.add_argument(
+        "--labels",
+        default="",
+        help="人工标注 JSON（samples/benchmark/kick-labels.json），用于 sign_accuracy 与矢状面角误差",
+    )
+    parser.add_argument(
+        "--direction-weight",
+        type=float,
+        default=0.0,
+        help="§4 方向向量先验权重（0 = 只有符号 hinge）；用于小权重扫描",
+    )
+    parser.add_argument(
+        "--direction-sparsity",
+        type=float,
+        default=0.0,
+        help="§4 深度稀疏项权重（0 = 关闭）；默认关闭，只在扫描时打开",
+    )
+    parser.add_argument(
+        "--write-labels",
+        default="",
+        help="把本次结果的矢状面角与符号写成标注草稿（§1.2 的半自动起点：先跑一遍再人工修正）",
+    )
     args = parser.parse_args(argv)
+    if args.depth_sign_mode:
+        args.depth_sign = True
+    _pin_settings_for_run(args)
 
     metrics = run(args)
     baseline = None

@@ -190,3 +190,134 @@ pytest tests/test_yaw.py -q
   本身就能压住 z 的随机抖动；但**结构性**的 z 偏差（例如整段时间内深度整体偏大）它压不住，
   那部分只有宽度比方法能纠，这也是任务 3.2 把 yaw 先验塞进拟合的原因。
 
+---
+
+## 踢腿专项（前踢腿的方向与幅度）
+
+对应 `docs/todo-kick-depth-accuracy.md` §1 与 §8.1。这里只回答两个问题：
+
+1. **方向对不对**（`sign_accuracy`）：每根骨段 `sign(Δz)` 与人工标注是否一致；
+2. **幅度差多少**（`kick_sagittal_error_deg`）：大腿抬起角、小腿屈曲角相对标注的误差。
+
+「方向」是必达档：错了就是播放时"腿朝反方向踢"。「幅度」在正面机位下**没有观测**，
+这里的数字只用于比较不同后端的相对改善，不代表"真实踢了多高"。
+
+### 素材（踢腿三档，BM-05 ~ BM-07）
+
+清单本体在 `samples/benchmark/README.md`（视频不进仓库）。重录时这些参数必须与表一致，
+否则 `sign_accuracy` 不可复现：
+
+| 编号 | 文件名 | 机位角 | 机位高度 | 距离 | 分辨率 | 帧率 | 动作次数 | 时长 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `BM-05` | `BM-05-front-kick.mp4` | 正对（yaw≈0°） | 胸齐平（≈1.2 m） | 2.5 m | 1080×1920 | 30 | 左右各 3 次 | ≤10 s |
+| `BM-06` | `BM-06-side-kick.mp4` | 正侧（yaw≈90°） | 胸齐平 | 2.5 m | 1080×1920 | 30 | 左右各 3 次 | ≤10 s |
+| `BM-07` | `BM-07-front30-kick.mp4` | 正面斜 30° | 胸齐平 | 2.5 m | 1080×1920 | 30 | 左右各 3 次 | ≤10 s |
+
+每段先静止站立 3 秒（给 `temporal` 后端留时序证据），踢完再站 2 秒（便于对齐回落相位）。
+
+### 指标
+
+| 指标 | 定义 | 期望方向 |
+| --- | --- | --- |
+| `sign_accuracy` | 与标注 `signs` 一致的 (帧 × 骨段) 占比；另分 `_thigh` / `_shank` / `_swingLeg` / `_supportLeg` | 越高越好 |
+| `kick_sagittal_error_thigh_{mean,p95}_deg` | 大腿抬起角误差（度），站立 0°、水平前抬 90° | 越小越好 |
+| `kick_sagittal_error_shank_{mean,p95}_deg` | 小腿屈曲角误差（度），伸直 0°、屈膝为正 | 越小越好 |
+| `kick_phase_max_frame_error` | 相位检测（起脚/最大伸展/回落）与标注的最大帧差 | ≤3 帧 |
+| `depth_sign_flips` | 导出帧上 `sign(Δz)` 的帧间翻转次数 | 越小越好（翻面 = 故障） |
+
+### 复现命令
+
+```powershell
+# 真实素材（三档后端；第三条需要 models/videopose3d-h36m.onnx）
+python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 --depth-sign --depth-sign-mode temporal --labels samples/benchmark/kick-labels.json --json out/bm05-temporal.json
+python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 --labels samples/benchmark/kick-labels.json --json out/bm05-off.json
+python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 --depth-sign --depth-sign-mode model --labels samples/benchmark/kick-labels.json --json out/bm05-model.json
+
+# 与基线 diff（判定口径：符号准确率下降 >10 个百分点算劣化）
+python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 --depth-sign --depth-sign-mode temporal --labels samples/benchmark/kick-labels.json --baseline out/bm05-off.json
+
+# 没有素材时的等价自检：确定性合成前踢腿（真值来自投影前的 3D 骨架）
+python scripts/bench_depth.py --synthetic-kick --corrupt-signs --label kick-off --json out/kick_off.json
+python scripts/bench_depth.py --synthetic-kick --corrupt-signs --depth-sign-mode temporal --label kick-temporal --baseline out/kick_off.json --json out/kick_temporal.json
+```
+
+`--corrupt-signs` 是**故障注入**：按真实故障形态把部分帧的腿整体镜像（2D 投影与骨长
+一个像素都不变、只有 `Δz` 反号），用来验证指标确实能抓到"腿翻面"，避免指标本身自欺。
+
+### 改动前 / P0 基线（合成素材，2026-11-21）
+
+环境 `Windows / AMD64 / Python 3.13.3`，60 帧、1080×1920、30 fps、峰值抬腿 80°：
+
+| 指标 | 改动前（符号先验关） | P0 `temporal` | P0 `model`（缺权重） |
+| --- | --- | --- | --- |
+| `depth_sign_flips` | 16 | **1** | 1 |
+| `sign_accuracy` | 0.646 | **0.894** | 0.894 |
+| `sign_accuracy_thigh` | 0.643 | **0.875** | 0.875 |
+| `sign_accuracy_shank` | 0.649 | **0.912** | 0.912 |
+| `kick_sagittal_error_thigh_mean_deg` | 28.46° | **10.31°** | 10.31° |
+| `kick_sagittal_error_thigh_p95_deg` | 66.66° | **20.14°** | 20.14° |
+| `kick_sagittal_error_shank_mean_deg` | 42.38° | **4.89°** | 4.89° |
+| `kick_sagittal_error_shank_p95_deg` | 129.32° | **13.16°** | 13.16° |
+| `kick_phase_max_frame_error` | **2 帧** | 2 帧 | 2 帧 |
+| `reproj_error_px` | 26.90 | **8.06** | 8.06 |
+| `bone_length_cv_mean` | 0.019 | **0.0017** | 0.0017 |
+
+> 相位误差两列相同是预期的：它衡量的是"检测器与标注的一致性"，与深度先验无关。
+> 检测用的是**平滑前**的 2D 轨迹（平滑会把动作起点抹开 4~5 帧），这条口径写在
+> `postprocess/pipeline.py` 与 `bench_depth.py::kick_phase_error()` 的注释里。
+
+读法：
+
+- 符号翻转 16 → 1、准确率 0.646 → 0.894，这就是"必达档"的量化形态：**帧间翻面被压掉**；
+- 幅度误差同步大幅下降，但这是**间接收益**（翻面消失后拟合不再把腿留在错分支），
+  不是"深度变准了"；正面机位下幅度仍然不可验证，看 `depthConfidence` 与 `warnings`；
+- `model` 一列与 `temporal` 完全一致是因为**当前没有权重**：`DepthSignReport.notes` 会写
+  「未找到抬升模型…本次退回时序一致性模式」，`depthSign.mode` 也会如实回传 `temporal`。
+
+### §4 方向向量先验的权衡曲线（合成素材，2026-11-21）
+
+`--direction-weight` 打开 §4 的软方向先验（`ik_fit.depth_direction_weight`）。同一素材、
+同一后端（`temporal`），只改权重：
+
+| `direction_weight` | `reproj_error_px` | 大腿角误差 mean/p95 | 小腿角误差 mean/p95 | `sign_accuracy` |
+| --- | --- | --- | --- | --- |
+| 0（默认，只有 hinge） | **8.06** | 10.31° / 20.14° | **4.89°** / 13.16° | 0.894 |
+| 0.1 | 8.21 | 10.08° / 20.19° | 5.18° / 13.24° | 0.902 |
+| 0.2 | 8.47 | 9.99° / 20.24° | 5.37° / 13.27° | 0.902 |
+| 0.35 | 8.96 | 9.88° / 20.26° | 5.81° / 13.64° | 0.902 |
+| 0.6 | 9.65 | **9.61°** / 19.21° | 5.92° / 15.27° | 0.911 |
+
+读法（结论：**默认保持 0，先验实现保留但不启用**）：
+
+- 大腿误差每 0.1 权重只降 ~0.2°，而重投影每 0.1 权重涨 ~0.2 px；**≤1 px 预算内拿不到 −30%**；
+- 小腿误差随权重**变差**（4.89° → 5.92°）：方向先验用观测方向当目标，而观测方向本身带着
+  被 hinge 修正过的 z 幅值，等于把"错误幅度"再喂回去；
+- 因此按 `docs/todo-kick-depth-accuracy.md` §4 的决策规则，**归档为实验特性**：
+  `depth_direction_weight=0` 为默认值，`--direction-weight` 仅用于后续扫描；
+  真正要幅度只能走 §5.1（提高 2D 精度）或 §6（补拍正侧机位）。
+
+复现：
+
+```powershell
+foreach ($w in 0.1,0.2,0.35,0.6) {
+  python scripts/bench_depth.py --synthetic-kick --corrupt-signs --depth-sign-mode temporal `
+    --direction-weight $w --label "dir-$w" --json "out/dir_$w.json"
+}
+```
+
+### 真实素材与 §3.0 立项闸门
+
+`BM-05`~`BM-07` 需在本机录制（仓库不含视频本体，清单见 `samples/benchmark/README.md`），
+`BM-06` 的逐帧标注写入 `samples/benchmark/kick-labels.json` 后才能填下表：
+
+| 素材 | 后端 | `sign_accuracy` | 大腿角误差（mean/p95） | 小腿角误差（mean/p95） | 备注 |
+| --- | --- | --- | --- | --- | --- |
+| `BM-05` | 关 | 待录素材 | — | — | — |
+| `BM-05` | `temporal` | 待录素材 | — | — | — |
+| `BM-05` | `model` | 待权重 | — | — | 需先导出 `videopose3d-h36m.onnx` |
+
+> **§3.0 闸门状态**：`model` 后端的一致率（`auto_calibrate_ratio`）尚无实测数字，因为
+> 仓库没有 Human3.6M 权重。闸门判定规则不变：一致率 0.3~0.55 → 归档 §3（换 MotionBERT
+> 是同一个信息缺失问题），<0.3 → 深度轴镜像并整体取反，≥0.55 → 通过。
+> 在拿到数字之前，§3 的实现保持"可切换但不默认启用"。
+

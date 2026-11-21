@@ -237,6 +237,9 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 | 断点续算 | 开启 | 同时设置 `checkpoint=true` 与 `resume=true` |
 | 骨长约束拟合 | 开启 | 仅在所选引擎能输出米制 world landmarks 时生效；ONNX 引擎会置灰并关闭 |
 | 深度方向修正 | 关闭 | 单目下每根骨段只剩「往前还是往后」一个比特；开启后用整段动作的时序一致性把它定住（前踢腿不再被解成后踢腿）。需要 ≥30 帧，只在符号反了时纠正，不动 2D 与骨长 |
+| 深度方向后端 | `temporal` | 勾选「深度方向修正」后可选：`temporal`（零依赖，默认）/ `model`（ONNX 抬升器）。`model` 在 `models/` 里没有对应权重时**置灰不可选**；运行中若权重缺失或自校准判定无效，会退回 `temporal`，并在质检卡片上显示实际后端与原因 |
+| 下肢检测阈值 | 空（用服务级 0.5） | `min_detection_confidence` / `min_tracking_confidence`；下肢在画面里只占十几行像素时，默认 0.5 会把腿判成"没看见"，深度只能靠躯干外推 |
+| 下肢重跑 | 跟随服务级（开启） | 下肢平均可见度低于 0.5 且坏帧占比 >35% 时，用 `heavy` 档模型重跑整段；摘要里的 `retryReason` 会写明为什么跑了两遍 |
 
 面板会显示「预计 N 帧」。所有参数在任务运行期间禁用。手/脸增强固定开启（界面无开关）；面板底部还有「清空缓存」按钮，删除断点文件让下次识别从第 1 帧重新开始。
 
@@ -857,7 +860,12 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | `DETECT_BODY_IK_FIT_FOV_DEGREES` | `60.0` | 相机水平视场角，10–150 度 |
 | `DETECT_BODY_Z_SMOOTHING_SCALE` | `0.3` | Z 轴 min_cutoff 相对 x/y 的系数 |
 | `DETECT_BODY_DEPTH_SIGN_ENABLED` | `false` | 置 `1` 时全局启用深度方向修正（即使界面开关未勾选） |
-| `DETECT_BODY_DEPTH_SIGN_MODE` | `temporal` | 后端：`temporal` 用世界坐标 z 做时序一致性（零新增依赖）/ `model` 用 ONNX 抬升器判方向 |
+| `DETECT_BODY_DEPTH_SIGN_MODE` | `temporal` | 后端：`temporal` 用世界坐标 z 做时序一致性（零新增依赖）/ `model` 用 ONNX 抬升器判方向（权重缺失自动退回 `temporal`，`summary.depthSign.mode` 会如实回传实际后端） |
+| `DETECT_BODY_LIFTER` | `videopose3d` | `model` 后端用哪个抬升器：`videopose3d` / `motionbert` / `agformer`，决定搜 `models/videopose3d-h36m.onnx` 还是 `motionbert-h36m.onnx` 等；三者契约相同（`[T,17,2] → [T,17,3]`），只用 Δz 符号 |
+| `DETECT_BODY_LOWER_BODY_REFINE` | `false` | MediaPipe 专用：下肢可见度低时把下半身裁出来再推理一次（ROI 重解），坏帧会多付一次推理 |
+| `DETECT_BODY_LOWER_LIMB_RETRY` | `true` | 下肢可见度不足时是否用更高档位模型重跑整段（只重跑一遍，不循环） |
+| `DETECT_BODY_LOWER_LIMB_RETRY_VISIBILITY` | `0.5` | 髋/膝/踝/脚跟/脚尖的平均可见度低于该值算「下肢不可靠」 |
+| `DETECT_BODY_LOWER_LIMB_RETRY_RATIO` | `0.35` | 不可靠帧占比超过该值才重跑（零星坏帧重跑不划算） |
 
 > 另有两个**不由 `Settings` 解析**的环境变量：`DETECT_BODY_WEBVIEW_DEBUG`（设置任意值打开 pywebview debug，由 `app/desktop/main.py` 直接读取）与 `DETECT_BODY_CONSOLE`（值为 `1` 时打包保留控制台，由 `scripts/package.*` 在打包阶段读取）。它们不会出现在 `Settings` 字段中。
 
@@ -1077,9 +1085,12 @@ pytest tests/test_export.py -q
 | 脚本 | 常用命令 | 作用 |
 | --- | --- | --- |
 | `scripts/bench.py` | `python scripts/bench.py --engine stub --synthetic --batch 1,4` | 推理链路吞吐基准；`--engine` 可选 `stub` / `auto` / `mediapipe` / `onnx` |
-| `scripts/bench_depth.py` | `python scripts/bench_depth.py --synthetic --json out/depth.json` | 深度 / 几何质量基准：`z_jitter`、`bone_length_cv`、`reproj_error_px`、`angle_drift_deg`、`depth_sign_flips`、`sagittal_motion_share` |
+| `scripts/bench_depth.py` | `python scripts/bench_depth.py --synthetic --json out/depth.json` | 深度 / 几何质量基准：`z_jitter`、`bone_length_cv`、`reproj_error_px`、`angle_drift_deg`、`depth_sign_flips`、`sagittal_motion_share`；踢腿专项加 `--labels` 后输出 `sign_accuracy`、`kick_sagittal_error_*`、`kick_phase_max_frame_error` |
 | `scripts/bench_z_smoothing.py` | `python scripts/bench_z_smoothing.py --json out/z_params.json` | Z 轴 One Euro 参数 A/B |
 | `scripts/export_videopose3d_onnx.py` | `python scripts/export_videopose3d_onnx.py --verify models/videopose3d-h36m.onnx` | 把 VideoPose3D 离线导出为 ONNX（供 `DETECT_BODY_DEPTH_SIGN_MODE=model`），或校验已有权重 |
+| `scripts/export_motionbert_onnx.py` | `python scripts/export_motionbert_onnx.py --verify models/motionbert-h36m.onnx` | 同上，导出 MotionBERT（DSTFormer），支持 `--mode dynamic/fixed` 两种 T 策略 |
+| `scripts/fuse_views.py` | `python scripts/fuse_views.py --front BM-05.mp4 --side BM-06.mp4 --out out/fused.json` | 双机位角度级融合（不三角化）：矢状面角度取侧视、额状面取正视，按动作相位对齐时间轴 |
+| `scripts/check_depth_sign_chain.py` | `python scripts/check_depth_sign_chain.py --mode model` | 深度方向修正链路自检（无视频/无权重也能跑）：阶段进度、`mode`、翻转次数、质检 notes 四项判定 |
 | `scripts/make_icon.py` | `python scripts/make_icon.py` | 无第三方依赖生成 512 PNG 与 256 ICO 图标 |
 
 `scripts/bench.py` 默认引擎是 `stub`，只验证基准工具与队列 / batch 链路，**不代表真实模型性能**。真实性能必须显式传 `--engine auto|mediapipe|onnx`。
@@ -1262,6 +1273,7 @@ pytest tests/test_export.py -q
 | 动作类型 | 建议机位 | 原因 |
 | --- | --- | --- |
 | 下蹲 / 弓步 / 前弓步 / 硬拉 | 正侧面 | 膝角、髋角在图像平面内，前缩误差最小 |
+| 前踢腿 / 直腿抬高 / 摆腿 | **正侧面**（若只能正面：务必配合双机位或接受"方向对、幅度不可信"） | 踢腿的位移几乎全在前后方向（Z 轴），正面机位下 2D 只看到腿长缩短，深度完全靠猜：方向可能对，但抬腿幅度不可验证 |
 | 转体 / 挥臂 / 上肢伸展 / 开合跳 | 正对 | 需要看清左右对称与水平方向角度 |
 | 走路 / 跑步 | 正侧（横向走） | 前后走会把位移交给最不可信的深度 |
 | 混合动作 | 正侧优先 | 对深度依赖最小，容错最高 |
@@ -1369,7 +1381,7 @@ python scripts/bench_depth.py samples/kick.mp4 --json out/kick-off.json --baseli
 python scripts/bench_z_smoothing.py --json out/z_params.json
 ```
 
-`docs/benchmark.md` 记录方法与历史结果；其中 `BENCH:START` / `BENCH:END` 之间由 `scripts/bench.py` 自动替换，不要手改。仓库**不包含真实基准视频**，只有 `samples/benchmark/README.md` 中的素材清单（BM-01 至 BM-04）。
+`docs/benchmark.md` 记录方法与历史结果；其中 `BENCH:START` / `BENCH:END` 之间由 `scripts/bench.py` 自动替换，不要手改。仓库**不包含真实基准视频**，只有 `samples/benchmark/README.md` 中的素材清单（BM-01 至 BM-07，其中 BM-05~07 是踢腿素材，标注放 `samples/benchmark/kick-labels.json`）。
 
 ---
 

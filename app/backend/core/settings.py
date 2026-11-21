@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     depth_sign_mode: Literal["temporal", "model"] = Field(
         "temporal", description="深度符号先验后端：temporal 零依赖 / model 需 ONNX 权重"
     )
+    lifter: Literal["videopose3d", "motionbert", "agformer"] = Field(
+        "videopose3d",
+        description="model 模式下用哪个抬升器（DETECT_BODY_LIFTER）：决定搜哪个 ONNX 权重文件；"
+        "三者输入输出契约相同（[T,17,2] → [T,17,3]），只取深度符号，幅度一律丢弃",
+    )
 
     # ---- 姿态引擎（任务 4） ----
     pose_engine: Literal["auto", "mediapipe", "onnx"] = "auto"
@@ -132,8 +137,35 @@ class Settings(BaseSettings):
     smooth_landmarks: bool = True
     mediapipe_gpu_delegate: bool = False
     onnx_pose_model: str | None = Field(default=None, description="RTMPose/RTMO 权重路径（留空自动搜 models/）")
+    enable_metric_engine: bool = Field(
+        False,
+        description="§7 米制增强引擎：置 1 才注册（额外依赖 torch + 自行准备权重，"
+        "权重许可仅限研究/非商业）。默认关闭，注册后推理内核仍是占位实现",
+    )
+    metric_model_path: str | None = Field(
+        default=None, description="米制模型权重路径（DETECT_BODY_METRIC_MODEL）；留空搜 models/metric-h36m.onnx"
+    )
     track_iou_threshold: float = Field(0.3, gt=0, lt=1)
     track_max_age: int = Field(15, ge=0, le=120, description="track 丢失后保留帧数")
+
+    # ---- 下肢质量与条件式重跑（§5.1） ----
+    lower_body_refine: bool = Field(
+        False,
+        description="MediaPipe 专用：下肢可见度低时对下半身裁剪再推理（ROI 重解）；默认关闭，"
+        "因为坏帧会多付一次推理",
+    )
+    lower_limb_retry: bool = Field(
+        True, description="下肢可见度不足时是否用更高档位模型重跑整段"
+    )
+    lower_limb_retry_visibility: float = Field(
+        0.5, ge=0.0, le=1.0, description="下肢（髋/膝/踝/脚跟/脚尖）平均可见度低于该值算「不可靠」"
+    )
+    lower_limb_retry_ratio: float = Field(
+        0.35,
+        ge=0.0,
+        le=1.0,
+        description="不可靠帧占比超过该值才重跑；低于它说明只是零星帧，重跑不划算",
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property

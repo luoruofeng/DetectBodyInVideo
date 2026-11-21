@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -42,6 +42,32 @@ from app.backend.skeleton.bundle import SkeletonBundle, SkeletonConfig, build_sk
 logger = get_logger("pipeline")
 
 
+class EngineOptions(BaseModel):
+    """引擎侧的检测阈值与重跑策略（§5.1）。
+
+    MediaPipe 的 ``min_detection_confidence`` / ``min_tracking_confidence`` 是"检测到的
+    姿态本身算不算数"的闸门；下肢在画面里只占一小块、又常被遮挡时，默认 0.5 会把腿判成
+    "没看见"，于是 z 只能靠躯干外推 —— 这正是前踢腿幅度失真的直接原因之一。
+    """
+
+    min_detection_confidence: float | None = Field(
+        None, ge=0.0, le=1.0, description="留空用服务级配置（DETECT_BODY_MIN_DETECTION_CONFIDENCE）"
+    )
+    min_tracking_confidence: float | None = Field(
+        None, ge=0.0, le=1.0, description="留空用服务级配置（DETECT_BODY_MIN_TRACKING_CONFIDENCE）"
+    )
+    lower_body_refine: bool | None = Field(
+        None,
+        description="MediaPipe 专用：下肢可见度低时对下半身裁剪再推理一次（ROI 重解，成本约 +1 次/坏帧）",
+    )
+    model_tier: Literal["lite", "full", "heavy"] | None = Field(
+        None, description="条件式重跑时使用的档位；留空用 heavy"
+    )
+    retry_with_heavy: bool | None = Field(
+        None, description="下肢可见度不足时是否重跑整段；留空跟随服务级配置"
+    )
+
+
 class AnalysisOptions(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -57,6 +83,11 @@ class AnalysisOptions(BaseModel):
         description="骨长约束拟合的快捷覆盖（HTTP/前端字段名 ikFit）；空则用 postprocess.ik_fit",
     )
     engine: Literal["auto", "mediapipe", "onnx"] = "auto"
+    engine_options: EngineOptions = Field(
+        default_factory=EngineOptions,
+        alias="engineOptions",
+        description="检测阈值 / 下肢裁剪重解 / 条件式重跑档位",
+    )
     refinement: RefinementConfig = Field(
         default_factory=RefinementConfig,
         description="手部 21 点 / 面部语义点增强；缺模型或缺依赖时自动降级",
@@ -86,6 +117,9 @@ class AnalysisResult(BaseModel):
     elapsed_seconds: float = 0.0
     processed_fps: float = 0.0
     notes: list[str] = Field(default_factory=list)
+    # §5.1 条件式重跑：让 UI 能说明"这次为什么跑了两遍"
+    retried_with_heavy: bool = False
+    retry_reason: str = ""
 
     @property
     def frames(self) -> list[PoseFrame]:
@@ -104,7 +138,152 @@ def _default_plan(settings: Settings) -> AccelerationPlan:
     return build_hardware_report(settings).acceleration
 
 
+# 髋 / 膝 / 踝 / 脚跟 / 脚尖（23~32）：腿部质量的判据只看这一段
+LOWER_LIMB_INDICES: tuple[int, ...] = (23, 24, 25, 26, 27, 28, 29, 30, 31, 32)
+
+
+def lower_limb_visibility(frames: Sequence[PoseFrame]) -> float:
+    """下肢关键点的平均可见度（0~1）；没有有效帧返回 0。"""
+    values: list[float] = []
+    for frame in frames:
+        if not frame.valid or len(frame.landmarks) < 33:
+            continue
+        for index in LOWER_LIMB_INDICES:
+            values.append(float(frame.landmarks[index].visibility))
+    return float(np.mean(values)) if values else 0.0
+
+
+def lower_limb_unreliable_ratio(frames: Sequence[PoseFrame], threshold: float) -> float:
+    """下肢平均可见度低于阈值的**帧**占比；这是"该不该重跑"的判据。"""
+    counted = 0
+    bad = 0
+    for frame in frames:
+        if not frame.valid or len(frame.landmarks) < 33:
+            continue
+        counted += 1
+        visibility = float(
+            np.mean([frame.landmarks[index].visibility for index in LOWER_LIMB_INDICES])
+        )
+        if visibility < threshold:
+            bad += 1
+    return bad / counted if counted else 0.0
+
+
 def analyze_video(
+    path: Path | str,
+    *,
+    probe: VideoProbe | None = None,
+    options: AnalysisOptions | None = None,
+    plan: AccelerationPlan | None = None,
+    settings: Settings | None = None,
+    engine: PoseEngine | None = None,
+    selection: EngineSelection | None = None,
+    progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+    on_inference_done: PreviewCallback | None = None,
+    on_partial_frames: PartialFramesCallback | None = None,
+) -> AnalysisResult:
+    """跑完整条链路；``engine`` 可注入（单测/复用已加载模型）。
+
+    这里只做一件事以外的编排：**条件式重跑**（§5.1）。下肢可见度不足时，用更高的
+    模型档位重跑一遍整段（"重跑下肢区间"需要局部重解，当前 ROI 重解在 MediaPipe
+    引擎内部由 ``lower_body_refine`` 完成，不再二次读取视频）。
+    """
+    settings = settings or get_settings()
+    options = options or AnalysisOptions()
+    result = _analyze_once(
+        path,
+        probe=probe,
+        options=options,
+        plan=plan,
+        settings=settings,
+        engine=engine,
+        selection=selection,
+        progress=progress,
+        should_cancel=should_cancel,
+        on_inference_done=on_inference_done,
+        on_partial_frames=on_partial_frames,
+    )
+    if engine is not None:
+        return result  # 注入引擎的调用方自己负责生命周期，不做二次推理
+    retry_settings = _retry_settings_for_quality(result, options, settings)
+    if retry_settings is None:
+        return result
+
+    logger.info("下肢可见度不足，按重档模型重跑：%s", retry_settings.prefer_model_tier)
+    if progress is not None:
+        progress(
+            AnalysisProgress(
+                frames_done=0,
+                frames_total=result.sampling.total_frames,
+                message="下肢关键点置信度偏低，正在用高精度模型重跑",
+                stage="inference",
+            )
+        )
+    retry = _analyze_once(
+        path,
+        probe=probe,
+        options=options,
+        plan=None,
+        settings=retry_settings,
+        engine=None,
+        selection=None,
+        progress=progress,
+        should_cancel=should_cancel,
+        on_inference_done=on_inference_done,
+        on_partial_frames=on_partial_frames,
+    )
+    retry.retried_with_heavy = True
+    retry.retry_reason = (
+        f"下肢平均可见度 {lower_limb_visibility(result.postprocess.frames):.2f} 偏低，"
+        f"已用 {retry.selection.model_tier} 档模型重跑整段"
+    )
+    retry.selection.reasons = [*retry.selection.reasons, retry.retry_reason]
+    return retry
+
+
+def _engine_settings(settings: Settings, overrides: EngineOptions) -> Settings:
+    """把"本次任务的引擎参数"落到一份 settings 副本上（引擎构造只认 settings）。"""
+    update: dict[str, object] = {}
+    if overrides.min_detection_confidence is not None:
+        update["min_detection_confidence"] = min(
+            0.999, max(0.001, overrides.min_detection_confidence)
+        )
+    if overrides.min_tracking_confidence is not None:
+        update["min_tracking_confidence"] = min(
+            0.999, max(0.001, overrides.min_tracking_confidence)
+        )
+    if overrides.lower_body_refine is not None:
+        update["lower_body_refine"] = overrides.lower_body_refine
+    if overrides.model_tier is not None:
+        update["prefer_model_tier"] = overrides.model_tier
+    return settings.model_copy(update=update) if update else settings
+
+
+def _retry_settings_for_quality(
+    result: AnalysisResult, options: AnalysisOptions, settings: Settings
+) -> Settings | None:
+    """判定是否需要提高模型档位重跑；返回 None 表示不需要。"""
+    if not settings.lower_limb_retry:
+        return None
+    if options.engine_options.retry_with_heavy is False:
+        return None
+    tier = result.selection.model_tier or result.selection.capabilities.model_tier
+    target = options.engine_options.model_tier or "heavy"
+    if tier == target:
+        return None
+    frames = result.postprocess.frames
+    visibility = lower_limb_visibility(frames)
+    ratio = lower_limb_unreliable_ratio(frames, settings.lower_limb_retry_visibility)
+    if visibility >= settings.lower_limb_retry_visibility and ratio < settings.lower_limb_retry_ratio:
+        return None
+    logger.info(
+        "条件式重跑触发：下肢可见度 %.2f，低于阈值的帧占 %.0f%%", visibility, ratio * 100
+    )
+    return settings.model_copy(update={"prefer_model_tier": target})
+
+
+def _analyze_once(
     path: Path | str,
     *,
     probe: VideoProbe | None = None,
@@ -133,7 +312,10 @@ def analyze_video(
     if engine is None:
         plan = plan or _default_plan(settings)
         engine, selection = select_engine(
-            plan, settings=settings, preferred=options.engine, runtime=options.perf
+            plan,
+            settings=_engine_settings(settings, options.engine_options),
+            preferred=options.engine,
+            runtime=options.perf,
         )
     else:
         engine.apply_runtime(options.perf)
@@ -335,7 +517,24 @@ def summarize(result: AnalysisResult) -> dict[str, object]:
             "flipsBefore": result.postprocess.depth_sign.flips_before,
             "flipsAfter": result.postprocess.depth_sign.flips_after,
             "disagreements": result.postprocess.depth_sign.disagreements,
+            # §8.3：后端/自校准/方向向量计数都要能直接读到，不用去解析 notes 里的中文
+            "lifter": result.postprocess.depth_sign.lifter,
+            "autoCalibrateRatio": result.postprocess.depth_sign.auto_calibrate_ratio,
+            "calibration": result.postprocess.depth_sign.calibration,
+            "directionSegments": result.postprocess.depth_sign.direction_segments,
+            "swingLeg": result.postprocess.depth_sign.swing_leg,
             "notes": result.postprocess.depth_sign.notes,
+        },
+        # §8.2：摆动腿与相位的结论单独一块，UI 不需要再从 notes 里猜
+        "kick": {
+            "swingLeg": result.postprocess.swing.swing_leg,
+            "swingConfidence": result.postprocess.swing.confidence,
+            "swingApplied": result.postprocess.swing.applied,
+            "energy": result.postprocess.swing.energy,
+            "detected": result.postprocess.kick_phases.detected,
+            "side": result.postprocess.kick_phases.side,
+            "phases": result.postprocess.kick_phases.phases,
+            "notes": [*result.postprocess.swing.notes, *result.postprocess.kick_phases.notes],
         },
         "hands": {
             "applied": result.postprocess.hands.applied,

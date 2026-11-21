@@ -24,6 +24,7 @@ from app.backend.engine.base import (
     LEFT_ANKLE,
     LEFT_ELBOW,
     LEFT_FOOT_INDEX,
+    LEFT_HEEL,
     LEFT_HIP,
     LEFT_KNEE,
     LEFT_SHOULDER,
@@ -33,6 +34,7 @@ from app.backend.engine.base import (
     RIGHT_ANKLE,
     RIGHT_ELBOW,
     RIGHT_FOOT_INDEX,
+    RIGHT_HEEL,
     RIGHT_HIP,
     RIGHT_KNEE,
     RIGHT_SHOULDER,
@@ -199,6 +201,161 @@ def make_frames(
     return frames
 
 
+def kick_points(degrees: float, *, side: str = "left") -> dict[int, np.ndarray]:
+    """站立姿态 + 单腿绕髋在矢状面内向前抬起 ``degrees`` 度（正向 = 朝镜头踢）。
+
+    旋转轴是 x（左右方向），所以 2D 投影只改变 y、深度 z 随之改变 —— 这正是
+    "正面机位看不见矢状面、只剩一个符号比特"的几何形态。
+    """
+    base = standing_points()
+    points = {key: value.copy() for key, value in base.items()}
+    angle = math.radians(max(0.0, float(degrees)))
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    base_side = "right" if side == "right" else "left"  # "both" 以左腿为基准再镜像
+    hip_index = LEFT_HIP if base_side == "left" else RIGHT_HIP
+    leg = (
+        (LEFT_KNEE, LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX)
+        if base_side == "left"
+        else (RIGHT_KNEE, RIGHT_ANKLE, RIGHT_HEEL, RIGHT_FOOT_INDEX)
+    )
+    hip = points[hip_index].copy()
+    for index in leg:
+        offset = points[index] - hip
+        points[index] = hip + np.array([offset[0], offset[1] * cos_a, offset[1] * sin_a])
+    if side == "both":
+        # 双腿同步前踢：给"无法区分摆动腿"的对称场景造数据（§5.2 的退回分支）
+        mirror = (
+            (LEFT_KNEE, RIGHT_KNEE),
+            (LEFT_ANKLE, RIGHT_ANKLE),
+            (LEFT_HEEL, RIGHT_HEEL),
+            (LEFT_FOOT_INDEX, RIGHT_FOOT_INDEX),
+        )
+        for source, target in mirror:
+            points[target] = points[source] * np.array([-1.0, 1.0, 1.0])
+    return points
+
+
+def make_kick_frames(
+    count: int = 60,
+    *,
+    peak_deg: float = 80.0,
+    fps: float = 30.0,
+    side: str = "left",
+    ramp: float = 0.25,
+    visibility: float = VISIBILITY,
+) -> list[PoseFrame]:
+    """合成"前踢腿"序列：起脚 → 最大伸展 → 回落，两端各 ``ramp`` 比例的过渡。
+
+    与 ``make_frames`` 一样是**几何自洽**的（真值 3D + 已知弱透视相机投影 2D），
+    因此可以直接当基准与单测的输入。
+    """
+    frames: list[PoseFrame] = []
+    for index in range(count):
+        phase = index / max(1, count - 1)
+        gain = max(0.0, min(1.0, phase / ramp, (1.0 - phase) / ramp))
+        points = kick_points(peak_deg * gain, side=side)
+        normalized = project_to_normalized(points)
+        frames.append(
+            PoseFrame(
+                index=index,
+                timestamp_ms=round(index * 1000.0 / fps, 4),
+                landmarks=[
+                    Landmark(
+                        x=normalized[i][0],
+                        y=normalized[i][1],
+                        z=normalized[i][2],
+                        visibility=visibility,
+                    )
+                    for i in range(LANDMARK_COUNT)
+                ],
+                world_landmarks=[
+                    Landmark(
+                        x=float(points[i][0]),
+                        y=float(points[i][1]),
+                        z=float(points[i][2]),
+                        visibility=visibility,
+                    )
+                    for i in range(LANDMARK_COUNT)
+                ],
+                score=visibility,
+                valid=True,
+                track_id=1,
+            )
+        )
+    return frames
+
+
+def kick_labels(
+    frames: Sequence[PoseFrame], *, side: str = "left", peak_frame: int | None = None
+) -> dict[str, object]:
+    """从**真值帧**生成 ``samples/benchmark/kick-labels.json`` 同结构的标注。
+
+    只用世界坐标算角度与符号，因此结果不含任何估计误差；基准脚本拿它当真值用。
+    """
+    from app.backend.postprocess.swing import sagittal_angles
+    from app.backend.skeleton.topology import node_map
+
+    names = {node.key: node.joint for node in node_map().values()}
+    keys = {
+        "left": ("left_hip", "left_knee", "left_ankle"),
+        "right": ("right_hip", "right_knee", "right_ankle"),
+    }[side]
+    hip_key, knee_key, ankle_key = keys
+    rows: list[dict[str, object]] = []
+    for frame in frames:
+        positions = {
+            node.key: np.array(
+                [
+                    frame.world_landmarks[node.index].x,
+                    frame.world_landmarks[node.index].y,
+                    frame.world_landmarks[node.index].z,
+                ]
+            )
+            for node in node_map().values()
+            if node.index is not None
+        }
+        hip, knee, ankle = positions[hip_key], positions[knee_key], positions[ankle_key]
+        thigh, shank = knee - hip, ankle - knee
+        # 角度口径与生产实现完全一致（同一个函数），避免"标注按 A 定义、指标按 B 定义"
+        angles = sagittal_angles(frame, side)
+        elevation, flexion = angles if angles is not None else (0.0, 0.0)
+        rows.append(
+            {
+                "index": frame.index,
+                "thighDeg": round(elevation, 3),
+                "shankDeg": round(flexion, 3),
+                "signs": {
+                    knee_key: 1 if thigh[2] > 0 else -1,
+                    ankle_key: 1 if shank[2] > 0 else -1,
+                },
+            }
+        )
+    if peak_frame is None:
+        elevations = [abs(float(item["thighDeg"])) for item in rows]  # type: ignore[arg-type]
+        top = max(elevations) if elevations else 0.0
+        peak_frame = rows[elevations.index(top)]["index"] if rows else 0
+        # 相位口径与 ``postprocess.swing.detect_kick_phases`` 对齐：
+        # 起止取"抬起角超过峰值 5%"的首末帧，峰值取抬起角最大的帧
+        moving = [
+            int(row["index"])
+            for row, value in zip(rows, elevations, strict=False)
+            if top > 1e-9 and value >= top * 0.05
+        ]
+        start = moving[0] if moving else (frames[0].index if frames else 0)
+        end = moving[-1] if moving else (frames[-1].index if frames else 0)
+    else:
+        start = frames[0].index if frames else 0
+        end = frames[-1].index if frames else 0
+    return {
+        "video": "synthetic-kick",
+        "fps": round(1000.0 / (frames[0].timestamp_ms or 33.333), 3) if frames else 30.0,
+        "swingLeg": side,
+        "frames": rows,
+        "phases": {"start": start, "peak": peak_frame, "return": end},
+        "note": "由 tests/synth_pose.py 从真值骨架生成，仅用于合成基准",
+    }
+
+
 def add_depth_noise(
     frames: Sequence[PoseFrame],
     *,
@@ -266,7 +423,10 @@ __all__ = [
     "add_depth_noise",
     "bone_length_errors",
     "bone_lengths",
+    "kick_labels",
+    "kick_points",
     "make_frames",
+    "make_kick_frames",
     "project_to_normalized",
     "rotate_about_vertical",
     "standing_points",

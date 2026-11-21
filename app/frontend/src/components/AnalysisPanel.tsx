@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react'
 
 import type { AnalysisOptions, EngineKind, JobStatus } from '../api/analysis'
+import type { LifterInfo } from '../api/models'
 import type { VideoMetadata } from '../api/videos'
 import type { UseAnalysis } from '../hooks/useAnalysis'
+import type { UseModels } from '../hooks/useModels'
 import { formatCompactNumber, formatTime } from '../lib/pose'
 import { ProgressBar } from './ProgressBar'
 import { AlertIcon, BoneIcon, SparkIcon } from './icons'
@@ -12,6 +14,23 @@ interface AnalysisPanelProps {
   analysis: UseAnalysis
   disabled: boolean
   onStart: (options: AnalysisOptions) => void
+  /** 用来判断「model 后端」的权重是否就绪（缺权重时把选项置灰并说明原因） */
+  models?: UseModels
+}
+
+const CALIBRATION_LABEL: Record<string, string> = {
+  passed: '自校准通过',
+  inverted: '深度轴镜像，已整体取反',
+  discarded: '判定无效，已退回时序模式',
+  skipped: '样本不足，未校核',
+  inactive: '未做自校准',
+}
+
+/** 深度后端的中文名：UI 只显示**实际**后端，避免"选了 model 其实跑的是 temporal"。 */
+function backendLabel(mode: string | undefined, lifter?: string): string {
+  if (!mode || mode === 'off') return '关闭'
+  if (mode === 'model') return `抬升模型${lifter ? `（${lifter}）` : ''}`
+  return '时序一致性（temporal）'
 }
 
 const VERDICT_STYLE: Record<string, string> = {
@@ -176,6 +195,92 @@ function QualityBlock({ status, loading }: { status: JobStatus | null; loading: 
         <span>处理 {summary.elapsedSeconds ? `${summary.elapsedSeconds.toFixed(1)}s` : '—'}</span>
       </div>
 
+      {/* §8.2：后端 / 自校准 / 摆动腿与相位，全部显示**实际**值（不是用户选择的档位） */}
+      {summary.depthSign && summary.depthSign.mode !== 'off' ? (
+        <div className="space-y-1 rounded-lg border border-line bg-white/[0.02] px-2.5 py-2 text-2xs">
+          <div className="flex flex-wrap items-center gap-x-2">
+            <span className="text-slate-500">深度后端</span>
+            <span className="font-mono text-slate-200">
+              {backendLabel(summary.depthSign.mode, summary.depthSign.lifter || undefined)}
+            </span>
+            {summary.depthSign.autoCalibrateRatio != null ? (
+              <span className="text-slate-500">
+                · 一致率 {(summary.depthSign.autoCalibrateRatio * 100).toFixed(0)}%
+              </span>
+            ) : null}
+            {summary.depthSign.calibration && summary.depthSign.calibration !== 'inactive' ? (
+              <span
+                className={
+                  summary.depthSign.calibration === 'discarded' ||
+                  summary.depthSign.calibration === 'inverted'
+                    ? 'text-warn'
+                    : 'text-ok'
+                }
+              >
+                · {CALIBRATION_LABEL[summary.depthSign.calibration] ?? summary.depthSign.calibration}
+              </span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap gap-x-3 text-slate-600">
+            <span>
+              摆动腿{' '}
+              <span className="font-mono text-slate-300">
+                {summary.kick?.swingLeg === 'left'
+                  ? '左'
+                  : summary.kick?.swingLeg === 'right'
+                    ? '右'
+                    : '未判定'}
+              </span>
+              {summary.kick?.swingApplied ? (
+                <span className="ml-1 text-slate-600">
+                  (置信度 {(summary.kick.swingConfidence * 100).toFixed(0)}%)
+                </span>
+              ) : null}
+            </span>
+            <span>
+              方向向量先验{' '}
+              <span className="font-mono text-slate-300">
+                {summary.depthSign.directionSegments ?? 0}
+              </span>{' '}
+              段
+            </span>
+            {summary.kick?.detected && summary.kick.phases.peak != null ? (
+              <span>
+                踢腿相位 起脚 #{summary.kick.phases.start} · 峰值 #{summary.kick.phases.peak} · 回落 #
+                {summary.kick.phases.return}
+              </span>
+            ) : null}
+          </div>
+          {/* 降级原因一律取后端回传的 notes，不在前端另写判断（§2.4） */}
+          {summary.depthSign.notes?.length ? (
+            <details className="text-slate-600">
+              <summary className="cursor-pointer select-none text-slate-500">
+                后端说明（{summary.depthSign.notes.length}）
+              </summary>
+              <ul className="mt-1 space-y-0.5">
+                {summary.depthSign.notes.map((note) => (
+                  <li key={note}>· {note}</li>
+                ))}
+              </ul>
+            </details>
+          ) : null}
+        </div>
+      ) : null}
+
+      {summary.retriedWithHeavy && summary.retryReason ? (
+        <p className="rounded-lg border border-accent/20 bg-accent/[0.06] px-2.5 py-2 text-2xs text-accent">
+          {summary.retryReason}
+        </p>
+      ) : null}
+
+      {/* 幅度不可信的提示：正面机位下方向可以定住，抬腿幅度没有观测 */}
+      {depthConfidence < 0.5 || (summary.kick?.detected && depthConfidence < 0.75) ? (
+        <p className="text-2xs text-slate-500">
+          单目没有深度观测：这里的关节角只保证"方向对、骨长恒定"，<span className="text-warn">抬腿幅度不可验证</span>
+          。需要幅度时请补拍正侧面机位（见 README「按动作类型选机位」）。
+        </p>
+      ) : null}
+
       {quality.issues.length ? (
         <ul className="space-y-1 rounded-lg border border-warn/20 bg-warn/[0.06] p-2.5">
           {quality.issues.map((issue) => (
@@ -202,7 +307,7 @@ function QualityBlock({ status, loading }: { status: JobStatus | null; loading: 
 }
 
 /** 右侧识别参数 + 进度 + 质检。 */
-export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPanelProps) {
+export function AnalysisPanel({ video, analysis, disabled, onStart, models }: AnalysisPanelProps) {
   const [engine, setEngine] = useState<EngineKind>('auto')
   const [everyN, setEveryN] = useState(1)
   const [targetFps, setTargetFps] = useState('')
@@ -212,6 +317,18 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
   const [ikFit, setIkFit] = useState(true)
   // 深度方向修正默认关闭：它需要"时序证据"（≥30 帧）且会改变既有输出，属于可选项
   const [depthSign, setDepthSign] = useState(false)
+  // §2.4：后端可选；缺权重时 model 置灰（否则勾了也只会静默退回 temporal）
+  const [depthSignMode, setDepthSignMode] = useState<'temporal' | 'model'>('temporal')
+  // §5.1：检测阈值留空 = 用服务级配置；下肢重跑默认跟随服务级
+  const [minDetection, setMinDetection] = useState('')
+  const [minTracking, setMinTracking] = useState('')
+  const [lowerBodyRefine, setLowerBodyRefine] = useState(false)
+  const [heavyRetry, setHeavyRetry] = useState(true)
+
+  const lifters: LifterInfo[] = models?.payload?.lifters ?? []
+  const readyLifter = lifters.find((item) => item.present)
+  const modelBackendReady = readyLifter !== undefined
+  const activeMode = depthSign && depthSignMode === 'model' && modelBackendReady ? 'model' : 'temporal'
 
   const running = analysis.phase === 'queued' || analysis.phase === 'running'
   const selection = analysis.status?.selection
@@ -233,6 +350,13 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
 
   /** 组装本次识别参数；``resumeOverride`` 用于「清空缓存」强制从头识别。 */
   const buildOptions = (resumeOverride?: boolean): AnalysisOptions => ({
+    engineOptions: {
+      // 留空 = 不覆盖服务级配置（null 在 pydantic 里表示"显式置空"，语义不同）
+      ...(minDetection ? { minDetectionConfidence: Number(minDetection) } : {}),
+      ...(minTracking ? { minTrackingConfidence: Number(minTracking) } : {}),
+      lowerBodyRefine,
+      retryWithHeavy: heavyRetry,
+    },
     engine,
     sampling: {
       every_n_frames: everyN,
@@ -252,7 +376,14 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
       checkpoint: resume,
     },
     ikFit: { enabled: ikFit && fitAvailable },
-    postprocess: { depth_sign: { enabled: depthSign && fitAvailable, mode: 'temporal' } },
+    postprocess: {
+      depth_sign: {
+        enabled: depthSign && fitAvailable,
+        // 传"实际会生效"的档位：权重没就绪时不要让后端去猜
+        mode: activeMode,
+        autoCalibrate: true,
+      },
+    },
     max_frames: null,
   })
 
@@ -407,6 +538,90 @@ export function AnalysisPanel({ video, analysis, disabled, onStart }: AnalysisPa
               预计 {estimatedFrames ? `${formatCompactNumber(estimatedFrames)} 帧` : '—'}
             </span>
           </div>
+
+          {/* §2.4 深度后端 + §5.1 下肢专项 */}
+          <div className="grid grid-cols-2 gap-2.5">
+            <label className="space-y-1">
+              <span className="label">深度方向后端</span>
+              <select
+                className="field"
+                value={depthSignMode}
+                onChange={(event) => setDepthSignMode(event.target.value as 'temporal' | 'model')}
+                disabled={running || !depthSign || !fitAvailable}
+                title={
+                  modelBackendReady
+                    ? 'temporal：用整段动作的时序一致性定方向（零依赖）。model：用 ONNX 抬升器判方向，只取符号'
+                    : '抬升模型权重未就绪：把 videopose3d-h36m.onnx / motionbert-h36m.onnx 放到 models/ 后才会启用'
+                }
+              >
+                <option value="temporal">时序一致性（temporal）</option>
+                <option value="model" disabled={!modelBackendReady}>
+                  {modelBackendReady
+                    ? `抬升模型（${readyLifter?.name}）`
+                    : '抬升模型（缺权重）'}
+                </option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="label">下肢检测阈值（可空）</span>
+              <input
+                className="field font-mono"
+                inputMode="decimal"
+                placeholder="如 0.4"
+                value={minDetection}
+                onChange={(event) => setMinDetection(event.target.value.replace(/[^\d.]/g, ''))}
+                disabled={running}
+                title="MediaPipe 的 min_detection_confidence：下肢只占十几行像素时，0.5 会把腿判成「没看见」，深度只能靠躯干外推"
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-line bg-white/[0.02] px-3 py-2">
+            <label
+              className="flex cursor-pointer items-center gap-1.5 text-2xs text-slate-400"
+              title="下肢可见度低时把下半身裁出来再推理一次（ROI 重解）；坏帧会多付一次推理"
+            >
+              <input
+                type="checkbox"
+                className="h-3 w-3 accent-accent"
+                checked={lowerBodyRefine}
+                onChange={(event) => setLowerBodyRefine(event.target.checked)}
+                disabled={running || engine === 'onnx'}
+              />
+              下肢裁剪重解
+            </label>
+            <label
+              className="flex cursor-pointer items-center gap-1.5 text-2xs text-slate-400"
+              title="下肢平均可见度低于 0.5 且坏帧占比 >35% 时，用 heavy 档模型重跑整段；摘要会写明原因"
+            >
+              <input
+                type="checkbox"
+                className="h-3 w-3 accent-accent"
+                checked={heavyRetry}
+                onChange={(event) => setHeavyRetry(event.target.checked)}
+                disabled={running}
+              />
+              下肢差时重跑
+            </label>
+            <label className="flex items-center gap-1.5 text-2xs text-slate-400">
+              跟踪阈值
+              <input
+                className="w-14 rounded-md border border-line bg-elevated px-1.5 py-0.5 font-mono text-2xs text-slate-200"
+                inputMode="decimal"
+                placeholder="0.5"
+                value={minTracking}
+                onChange={(event) => setMinTracking(event.target.value.replace(/[^\d.]/g, ''))}
+                disabled={running}
+              />
+            </label>
+          </div>
+
+          {!modelBackendReady && lifters.length ? (
+            <p className="text-2xs text-slate-500">
+              要启用 model 后端，把 {lifters.map((item) => item.filename).join(' / ')} 放到 models/
+              （可用 scripts/export_videopose3d_onnx.py 与 scripts/export_motionbert_onnx.py 离线导出）。
+            </p>
+          ) : null}
 
           {analysis.error ? (
             <div className="space-y-1.5 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-2xs text-danger">

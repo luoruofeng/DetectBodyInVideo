@@ -1,0 +1,13 @@
+{
+  "video": "BM-06-side-full.mp4",
+  "status": "pending-annotation",
+  "fps": 30,
+  "swingLeg": "left",
+  "note": "逐帧人工标注真值（§1.2）。角度定义：thighDeg = 矢状面内大腿相对竖直向下的抬起角（站立 0、水平前抬 90）；shankDeg = 小腿相对大腿延长线的屈曲角（伸直 0）。signs = 该帧每根骨段 sign(Δz) 的真值，-1 表示子关节更靠近镜头（向前踢）。可用 `python scripts/bench_depth.py samples/benchmark/BM-06-side-full.mp4 --write-labels samples/benchmark/kick-labels.draft.json` 生成草稿后逐帧修正。",
+  "phases": {
+    "start": null,
+    "peak": null,
+    "return": null
+  },
+  "frames": []
+}

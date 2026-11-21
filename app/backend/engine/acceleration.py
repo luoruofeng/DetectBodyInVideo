@@ -208,3 +208,24 @@ def build_hardware_report(settings: Settings | None = None) -> HardwareReport:
         system=system,
         acceleration=decide_acceleration(system, settings=settings),
     )
+
+
+# --------------------------------------------------------------------------- #
+# ONNX EP 选型（唯一真源）
+# --------------------------------------------------------------------------- #
+def onnx_execution_providers(available: list[str] | None = None) -> list[str]:
+    """按优先级返回可用的 onnxruntime EP 列表，CPU 永远兜底。
+
+    存在的意义：``depth_sign`` 的抬升器后端与姿态引擎都要挑 EP。这里只保留**一处**
+    候选列表（``PRIORITY`` + CPU），避免各模块各写一份、改一处漏一处。
+    """
+    if available is None:
+        try:
+            import onnxruntime as ort  # noqa: PLC0415 - 延迟导入，缺依赖时不影响其它能力
+        except Exception:  # pragma: no cover - 依赖缺失
+            return ["CPUExecutionProvider"]
+        available = list(ort.get_available_providers())
+    providers = [real for wanted in PRIORITY if (real := _find_provider(available, wanted))]
+    cpu = _find_provider(available, "cpuexecutionprovider") or "CPUExecutionProvider"
+    providers.append(cpu)
+    return providers

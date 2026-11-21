@@ -168,6 +168,18 @@ def select_engine(
 def _register_defaults() -> None:
     register_engine("mediapipe", _named_factory(MediaPipePoseEngine, "mediapipe"), priority=20)
     register_engine("onnx", _named_factory(OnnxPoseEngine, "onnx"), priority=10)
+    # §7：米制增强只在源码模式手动开启时才注册。默认不注册 → 不占显存、不改变选型顺序，
+    # 也不会让"可选增强"变成每个用户都要面对的失败路径。
+    try:
+        from app.backend.core.settings import get_settings
+
+        if get_settings().enable_metric_engine:
+            from app.backend.engine.metric_engine import MetricPoseEngine
+
+            register_engine("metric", _named_factory(MetricPoseEngine, "metric"), priority=30)
+            logger.info("米制增强引擎已注册（推理内核未实现，仅契约与降级路径）")
+    except Exception:  # noqa: BLE001 - 配置不可用/导入失败都不该挡住启动
+        logger.debug("米制引擎注册跳过", exc_info=True)
 
 
 def _named_factory(engine_class: type[PoseEngine], name: str) -> EngineFactory:

@@ -34,6 +34,9 @@ cuda = ["onnxruntime-gpu>=1.18", "pynvml>=11.5"]
 # Apple Silicon：onnxruntime 自带 CoreML EP，无需额外包；保留 extra 便于脚本统一
 mac = []
 windows = ["pynvml>=11.5"]
+# 米制（metric）增强：只在源码模式启用，权重不随发行版分发（许可决策见 docs/packaging.md §7）。
+# 装了这个 extra 也不会改变默认行为：Set DETECT_BODY_ENABLE_METRIC_ENGINE=1 才注册引擎。
+metric = ["torch>=2.2"]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",

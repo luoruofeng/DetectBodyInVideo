@@ -52,6 +52,13 @@ from app.backend.postprocess.smoothing import (
     smooth_frames,
     smooth_world_pass,
 )
+from app.backend.postprocess.swing import (
+    KickPhaseReport,
+    SwingConfig,
+    SwingLegReport,
+    detect_kick_phases,
+    identify_swing_leg,
+)
 from app.backend.skeleton.orientation import (
     YawConfig,
     YawEstimate,
@@ -79,6 +86,10 @@ class PostProcessConfig(BaseModel):
     depth_sign: DepthSignConfig = Field(
         default_factory=DepthSignConfig,
         description="深度方向（每骨段 1 个比特）先验；默认关闭，开启后由 ik_fit 的 hinge 项执行",
+    )
+    swing: SwingConfig = Field(
+        default_factory=SwingConfig,
+        description="摆动腿识别与踢腿相位（只读 2D 轨迹）：给方向先验分配权重，不改变坐标",
     )
     yaw: YawConfig = Field(default_factory=YawConfig)
     estimate_orientation: bool = Field(
@@ -129,6 +140,7 @@ def legacy_postprocess_config() -> PostProcessConfig:
             depth_sign_weight=0.0,
         ),
         depth_sign=DepthSignConfig(enabled=False),
+        swing=SwingConfig(enabled=False),
         estimate_orientation=False,
         quality=QualityConfig(enable_depth_gate=False, enable_framing_rules=False),
     )
@@ -143,6 +155,8 @@ class PostProcessResult(BaseModel):
     hands: HandStabilityReport = Field(default_factory=HandStabilityReport)
     fit: FitReport = Field(default_factory=FitReport)
     depth_sign: DepthSignReport = Field(default_factory=DepthSignReport)
+    swing: SwingLegReport = Field(default_factory=SwingLegReport)
+    kick_phases: KickPhaseReport = Field(default_factory=KickPhaseReport)
     yaw: list[YawEstimate] = Field(default_factory=list)
     tracks: list[TrackSummary] = Field(default_factory=list)
     primary_track_id: int | None = None
@@ -230,6 +244,19 @@ def run_postprocess(
         yaw_estimates = estimate_yaws(final, lengths, config.yaw, aspect=aspect)
         emit("yaw", "估计身体朝向", len(final), max(1, len(final)))
 
+    # 2.5) 摆动腿 / 踢腿相位：只用 2D 轨迹，不引入新的深度假设。
+    #    用途是给方向先验分配权重：摆动腿更强、支撑腿更保守；最大伸展附近放宽、静止段收紧。
+    #    注意用的是**平滑前**的 2D 轨迹：平滑会把动作起点抹开 4~5 帧，相位会整体滞后
+    #    （平滑是为了好看，不是为了定位动作时刻；帧号在两条序列里是一一对应的）。
+    emit("swing", "识别摆动腿与相位", 0, 1)
+    swing_report = identify_swing_leg(ordered, config.swing)
+    phases_report = detect_kick_phases(
+        ordered,
+        swing_report.swing_leg if swing_report.swing_leg != "none" else None,
+        config.swing,
+    )
+    emit("swing", "识别摆动腿与相位", 1, 1)
+
     # 3) 深度符号：单目下每根骨段只剩"Δz 取正还是取负"一个比特，逐帧由引擎 z 决定
     #    就会来回翻（前踢腿被解成后踢腿）。这一步只产符号，不产坐标、不改幅度。
     sign_map: dict[int, dict[str, tuple[int, float]]] = {}
@@ -240,6 +267,8 @@ def run_postprocess(
             config.depth_sign,
             lengths=lengths,
             aspect=aspect,
+            swing_leg=swing_report.swing_leg,
+            phases=phases_report,
             progress=lambda done, total_segments: emit(
                 "lift", "修正前后方向", done, total_segments
             ),
@@ -303,6 +332,8 @@ def run_postprocess(
         hands=hand_report,
         fit=fit_report,
         depth_sign=depth_sign_report,
+        swing=swing_report,
+        kick_phases=phases_report,
         yaw=yaw_estimates,
         tracks=result.tracks,
         primary_track_id=result.primary_track_id,

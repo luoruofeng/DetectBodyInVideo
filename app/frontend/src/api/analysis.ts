@@ -101,6 +101,16 @@ export interface DepthSignSummary {
   /** 时序平滑后下发符号的帧间翻转次数 */
   flipsAfter: number
   disagreements: number
+  /** 实际使用的抬升器（videopose3d / motionbert / agformer）；mode=temporal 时为空或"尝试过哪个" */
+  lifter?: string
+  /** 自校准一致率 0~1；null/undefined = 未做（temporal 或样本不足） */
+  autoCalibrateRatio?: number | null
+  /** 自校准结论：通过 / 深度轴镜像已取反 / 判定无效 / 未做 */
+  calibration?: 'inactive' | 'skipped' | 'passed' | 'inverted' | 'discarded' | string
+  /** §4 方向向量先验生效的 (帧 × 骨段) 数量；0 = 只有符号（hinge） */
+  directionSegments?: number
+  /** §5.2 摆动腿识别结果 */
+  swingLeg?: 'left' | 'right' | 'none' | string
   notes: string[]
 }
 
@@ -116,6 +126,11 @@ export interface AnalysisSummary {
   fit: FitSummary
   /** 深度方向先验（后端字段 depthSign）；默认关闭时 mode 为 'off' */
   depthSign?: DepthSignSummary
+  /** 摆动腿与相位（§8.2）；旧后端没有这个字段 */
+  kick?: KickSummary
+  /** §5.1 条件式重跑：说明这次为什么跑了两遍 */
+  retriedWithHeavy?: boolean
+  retryReason?: string
   tracks: TrackSummary[]
   primaryTrackId: number | null
   targetTrackId: number | null
@@ -246,6 +261,37 @@ export interface DepthSignOptions {
   mode?: 'temporal' | 'model'
   window?: number
   min_agreement?: number
+  /** model 后端的抬升器权重路径；留空自动搜 models/<lifter>-h36m.onnx */
+  modelPath?: string
+  /** 用同段视频的 world z 符号一致率判断模型是否镜像/无效（默认开） */
+  autoCalibrate?: boolean
+  /** 模型的左右约定与 BlazePose 相反时置 true */
+  swapLeftRight?: boolean
+}
+
+/** 引擎侧检测阈值与条件式重跑（§5.1）。 */
+export interface EngineOptions {
+  minDetectionConfidence?: number
+  minTrackingConfidence?: number
+  /** MediaPipe 专用：下肢可见度低时裁剪下半身再推理 */
+  lowerBodyRefine?: boolean
+  /** 条件式重跑使用的档位；留空为 heavy */
+  modelTier?: 'lite' | 'full' | 'heavy' | null
+  /** 下肢可见度不足时是否重跑整段；留空跟随服务级配置 */
+  retryWithHeavy?: boolean | null
+}
+
+/** 摆动腿 / 踢腿相位（§8.2）：只读 2D 轨迹，不改变坐标。 */
+export interface KickSummary {
+  swingLeg: 'left' | 'right' | 'none' | string
+  swingConfidence: number
+  swingApplied: boolean
+  energy: Record<string, number>
+  detected: boolean
+  side: 'left' | 'right' | 'none' | string
+  /** start / acceleration / peak / return → 帧号 */
+  phases: Record<string, number>
+  notes: string[]
 }
 
 export interface PostprocessOptions {
@@ -254,6 +300,8 @@ export interface PostprocessOptions {
 
 export interface AnalysisOptions {
   engine?: EngineKind
+  /** 引擎阈值 / 下肢裁剪重解 / 条件式重跑（后端字段 engineOptions） */
+  engineOptions?: EngineOptions
   sampling?: SamplingOptions
   skeleton?: SkeletonOptions
   refinement?: RefinementOptions

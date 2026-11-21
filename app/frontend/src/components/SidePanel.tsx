@@ -124,7 +124,15 @@ export function SidePanel({
     >
       <ModelCard models={models} recommendedTier={hardware?.acceleration.model_tier} />
       <ShootingGuideCard />
-      {video ? <AnalysisPanel video={video} analysis={analysis} disabled={false} onStart={onStart} /> : null}
+      {video ? (
+        <AnalysisPanel
+          video={video}
+          analysis={analysis}
+          disabled={false}
+          onStart={onStart}
+          models={models}
+        />
+      ) : null}
       {video ? <ExportCard analysis={analysis} /> : null}
       {video ? (
         <Preview3DCard

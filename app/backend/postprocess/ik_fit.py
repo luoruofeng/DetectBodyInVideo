@@ -149,6 +149,26 @@ class FitConfig(BaseModel):
         description="有符号先验的骨段按该比例衰减「深度压平」权重：压平会把 Δz 往 0 拽，"
         "与符号先验直接冲突。1.0 = 完全交给符号先验；0 = 保留压平权重",
     )
+    depth_direction_weight: float = Field(
+        0.0,
+        ge=0,
+        le=5,
+        description="§4 方向向量先验权重。与符号先验（hinge）不同：它要求整条骨段的**方向**"
+        "对齐「方向线段」，因此能约束幅度；默认 0（关闭），打开前必须用基准扫权重",
+    )
+    depth_direction_min_confidence: float = Field(
+        0.5,
+        ge=0,
+        le=1,
+        description="方向先验只采信置信度不低于该值的骨段；摆动腿通常 0.8+，支撑腿被折扣后低于它",
+    )
+    depth_sparsity_weight: float = Field(
+        0.0,
+        ge=0,
+        le=2,
+        description="深度稀疏项：把 Δz 往 0 拉（倾向「贴着正面平面」的动作）。默认 0 = 关闭；"
+        "它只作用于**没有方向先验**的骨段，避免与方向项互相拉扯",
+    )
     yaw_weight: float = Field(0.6, ge=0, le=5, description="yaw 先验权重（0 = 不用 yaw）")
     max_yaw_deviation: float = Field(25.0, gt=0, le=90, description="允许偏离 2D yaw 的角度（度）")
     loss: Literal["linear", "soft_l1", "huber", "cauchy", "arctan"] = "soft_l1"
@@ -804,6 +824,11 @@ class _FrameContext:
         "yaw_limit",
         "yaw_scale",
         "sparsity",
+        "dir_idx",
+        "dir_weight",
+        "dir_e1",
+        "dir_e2",
+        "sparse_scale",
     )
 
 
@@ -850,6 +875,81 @@ def _flat_scale(
     return flat
 
 
+def _entry_parts(entry: object) -> tuple[int, float, np.ndarray | None]:
+    """统一解包符号条目：``(符号, 置信度)`` 或 ``(符号, 置信度, 方向向量)``。
+
+    两元组是改造前的格式（也是单测里手写的格式），三元组是本轮新增的方向线段。
+    两种都接受，这样"只用符号"的调用方不需要跟着改。
+    """
+    values = list(entry)  # type: ignore[arg-type]
+    sign = int(values[0]) if values else 0
+    confidence = float(values[1]) if len(values) > 1 else 0.0
+    direction: np.ndarray | None = None
+    if len(values) > 2 and values[2] is not None:
+        vector = np.asarray(values[2], dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(vector))
+        if norm > 1e-9:
+            direction = vector / norm
+    return sign, confidence, direction
+
+
+def _orthonormal_basis(direction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """给单位方向找一组正交基（用于把"方向不对齐"拆成两个残差分量）。"""
+    helper = np.array([0.0, 1.0, 0.0])
+    if abs(float(np.dot(direction, helper))) > 0.9:
+        helper = np.array([1.0, 0.0, 0.0])
+    first = np.cross(direction, helper)
+    norm = float(np.linalg.norm(first))
+    first = first / norm if norm > 1e-9 else np.array([0.0, 0.0, 1.0])
+    second = np.cross(direction, first)
+    second_norm = float(np.linalg.norm(second))
+    second = second / second_norm if second_norm > 1e-9 else np.array([1.0, 0.0, 0.0])
+    return first, second
+
+
+def _direction_context(
+    signs: Mapping[str, tuple[int, float]] | None,
+    config: FitConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """把带方向的符号条目转成按节点下标对齐的方向先验数组。
+
+    返回 ``(idx, weight, e1, e2)``：残差为 ``sqrt(w)·(v·e1)`` 与 ``sqrt(w)·(v·e2)``，
+    两者平方和正好是 ``w·|v⊥|²`` —— 即"垂直于期望方向的偏差"的单侧二次惩罚。
+    """
+    empty = (np.zeros(0, dtype=np.int64), np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3)))
+    if not signs or config.depth_direction_weight <= 0:
+        return empty
+
+    indices: list[int] = []
+    weights: list[float] = []
+    firsts: list[np.ndarray] = []
+    seconds: list[np.ndarray] = []
+    base = math.sqrt(config.depth_direction_weight)
+    for index, node in enumerate(NODES):
+        entry = signs.get(node.key)
+        if entry is None or node.parent is None:
+            continue
+        sign, confidence, direction = _entry_parts(entry)
+        if direction is None or confidence < config.depth_direction_min_confidence:
+            continue
+        # 方向线段与符号先验必须同向：不同向说明两者矛盾，宁可不施加
+        if sign != 0 and float(np.sign(direction[2])) != float(sign) and abs(direction[2]) > 1e-6:
+            continue
+        first, second = _orthonormal_basis(direction)
+        indices.append(index)
+        weights.append(base * min(1.0, confidence))
+        firsts.append(first)
+        seconds.append(second)
+    if not indices:
+        return empty
+    return (
+        np.asarray(indices, dtype=np.int64),
+        np.asarray(weights, dtype=np.float64),
+        np.asarray(firsts, dtype=np.float64),
+        np.asarray(seconds, dtype=np.float64),
+    )
+
+
 def _sign_context(
     signs: Mapping[str, tuple[int, float]] | None,
     config: FitConfig,
@@ -877,7 +977,11 @@ def _sign_context(
         entry = signs.get(node.key)
         if entry is None or node.parent is None:
             continue
-        sign, confidence = entry
+        sign, confidence, direction = _entry_parts(entry)
+        # 方向项与 hinge 互斥（§4）：同一帧同一骨段只走一套先验，否则两个先验会互相拉扯
+        if direction is not None and config.depth_direction_weight > 0:
+            if confidence >= config.depth_direction_min_confidence:
+                continue
         if sign == 0 or confidence <= 0:
             continue
         weight = min(1.0, float(confidence))
@@ -912,14 +1016,17 @@ def flip_signed_depth(
         if node.parent is None:
             continue
         entry = signs.get(node.key)
-        if entry is None or entry[0] == 0 or entry[1] <= 0:
+        if entry is None:
+            continue
+        sign, confidence, _direction = _entry_parts(entry)
+        if sign == 0 or confidence <= 0:
             continue
         parent = flipped.get(node.parent)
         child = flipped.get(node.key)
         if parent is None or child is None:
             continue
         dz = float(child[2] - parent[2])
-        if dz == 0.0 or (dz > 0.0) == (entry[0] > 0):
+        if dz == 0.0 or (dz > 0.0) == (sign > 0):
             continue
         mirrored = np.array([child[0], child[1], 2.0 * float(parent[2]) - float(child[2])])
         flipped[node.key] = mirrored
@@ -981,6 +1088,7 @@ def _make_context(
     scale, u0, v0 = estimate_image_scale(frame, aspect)
     flat_scale = _flat_scale(NODES, positions, length, scale, config)
     sign_idx, sign_value, sign_weight, sign_confidence = _sign_context(signs, config, scale)
+    dir_idx, dir_weight, dir_e1, dir_e2 = _direction_context(signs, config)
     # 压平先验会把不可观测的 Δz 往 0 拽，与"这块骨段的深度该往哪边"直接冲突：
     # 有符号先验的骨段按置信度让位，没有符号先验的骨段仍按原来的门控压平。
     if sign_idx.size and config.depth_sign_flat_suppression > 0:
@@ -988,6 +1096,9 @@ def _make_context(
             flat_scale[index] *= max(
                 0.0, 1.0 - config.depth_sign_flat_suppression * float(sign_confidence[position])
             )
+    # 有方向先验的骨段深度幅度由方向项说了算，压平先验必须整体让位
+    if dir_idx.size:
+        flat_scale[dir_idx] = 0.0
     reproj_rows: list[int] = []
     obs_u: list[float] = []
     obs_v: list[float] = []
@@ -1102,14 +1213,25 @@ def _make_context(
     # 注意必须排除**整条子树**：残差是加在关节绝对位置上的，只排除骨段自身时，
     # 被它带动的子节点（脚尖、手）仍会把父骨段一起拽回去，排除就失效了。
     temporal_rows = np.arange(len(NODES), dtype=np.int64)
-    if config.temporal_axes == "z" and sign_idx.size:
+    if config.temporal_axes == "z" and (sign_idx.size or dir_idx.size):
         excluded = [False] * len(NODES)
-        signed = {int(index) for index in sign_idx}
+        signed = {int(index) for index in sign_idx} | {int(index) for index in dir_idx}
         for index in range(len(NODES)):
             ancestor = int(parent[index])
             excluded[index] = index in signed or (ancestor > 0 and excluded[ancestor])
         temporal_rows = np.flatnonzero([not flag for flag in excluded]).astype(np.int64)
     context.temporal_rows = temporal_rows
+    context.dir_idx = dir_idx
+    context.dir_weight = dir_weight
+    context.dir_e1 = dir_e1
+    context.dir_e2 = dir_e2
+    # 深度稀疏项只作用于"没有方向先验"的骨段：两个项都在动深度，一起上等于自相矛盾
+    sparse_scale = np.zeros(len(NODES), dtype=np.float64)
+    if config.depth_sparsity_weight > 0:
+        # 同样换成图像单位（每米深度 ↔ 多少归一化图像误差），才能和重投影直接比
+        sparse_scale[1:] = math.sqrt(config.depth_sparsity_weight) * max(1e-6, scale)
+        sparse_scale[dir_idx] = 0.0
+    context.sparse_scale = sparse_scale
     context.scale = scale
     context.u0 = u0
     context.v0 = v0
@@ -1192,6 +1314,20 @@ def _build_sparsity(context: _FrameContext, config: FitConfig) -> np.ndarray:
         for offset, node in enumerate(context.sign_idx):
             rows.append((cursor + offset, columns_for(int(node))))
         cursor += int(context.sign_idx.size)
+
+    # 方向先验：每个骨段两行（两个垂直分量），依赖同一条方向参数链
+    if context.dir_idx.size:
+        for offset, node in enumerate(context.dir_idx):
+            columns = columns_for(int(node))
+            rows.append((cursor + 2 * offset, columns))
+            rows.append((cursor + 2 * offset + 1, columns))
+        cursor += 2 * int(context.dir_idx.size)
+
+    # 深度稀疏项：每骨段一行（含被方向先验覆盖的骨段，它们权重为 0，但行留着更简单）
+    if float(np.max(getattr(context, "sparse_scale", np.zeros(1)))) > 0:
+        for node in range(1, node_count):
+            rows.append((cursor + node - 1, columns_for(node)))
+        cursor += node_count - 1
 
     if context.prior_scale > 0:
         for node in range(1, node_count):
@@ -1307,6 +1443,25 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
         local_z = positions[rows, 2] - positions[context.parent[rows], 2]
         wrong = np.maximum(0.0, -context.sign_value * local_z)
         parts.append(wrong * context.sign_weight)
+
+    # 方向向量先验（§4）：要求骨段方向对齐"方向线段"，因此也能约束幅度。
+    # 残差取"垂直于期望方向的两个分量"，平方和 = w·|v⊥|²；对齐时残差与梯度都为 0。
+    if context.dir_idx.size:
+        vectors = positions[context.dir_idx] - positions[context.parent[context.dir_idx]]
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        units = vectors / np.maximum(norms, 1e-9)
+        # 换成"图像单位"：偏离角 δ 在画面上的位移 ≈ δ·L·k。不乘这一步，
+        # 方向项的量纲就与重投影不同，权重扫描会得到"稍微加大就压过 2D"的假象。
+        gain = context.dir_weight * context.scale * context.length[context.dir_idx]
+        along_first = np.einsum("ij,ij->i", units, context.dir_e1) * gain
+        along_second = np.einsum("ij,ij->i", units, context.dir_e2) * gain
+        parts.append(np.concatenate([along_first, along_second]))
+
+    # 深度稀疏项（默认关闭）：把没有方向先验的骨段 Δz 往 0 拉，
+    # 让"贴着正面平面的动作"不会被凭空解出深度。
+    if float(np.max(context.sparse_scale)) > 0:
+        local_z = positions[1:, 2] - positions[context.parent[1:], 2]
+        parts.append(local_z * context.sparse_scale[1:])
 
     # 方向先验：2D 只约束"上下左右"，深度方向没有观测，必须靠先验选分支。
     # 注意它是加在**参数**（相对输入方向的偏移）上，而不是加在位置上：

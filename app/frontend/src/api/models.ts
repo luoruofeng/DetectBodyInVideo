@@ -26,11 +26,22 @@ export interface DownloadTask {
   finishedAt: number | null
 }
 
+/** 深度符号先验 model 后端的抬升器（§2.4：缺权重时不要把 model 档做成可选项）。 */
+export interface LifterInfo {
+  name: string
+  filename: string
+  present: boolean
+  path: string
+  receptiveField: number
+}
+
 export interface ModelsPayload {
   models: ModelFileInfo[]
   poseReady: boolean
   mirrorConfigured: boolean
   downloads: DownloadTask[]
+  /** 后向兼容：旧后端没有这个字段 */
+  lifters?: LifterInfo[]
 }
 
 export function listModels(): Promise<ModelsPayload> {

@@ -213,14 +213,17 @@ def test_select_engine_passes_plan_and_dedupes_notes(monkeypatch, tmp_path) -> N
         engine.close()
 
 
-def test_mediapipe_model_falls_back_to_available_tier(tmp_path) -> None:
-    from app.backend.engine.models import resolve_mediapipe_model
+def test_mediapipe_model_falls_back_to_available_tier(tmp_path, monkeypatch) -> None:
+    from app.backend.engine import models as models_module
 
+    # ``find_model`` 会再看一眼打包资源根 ``models/``；开发机上那里三档都在，
+    # 不隔离的话这个用例的"只有 full"假设就不成立（属于环境依赖，不是产品行为）
+    monkeypatch.setattr(models_module, "RESOURCE_ROOT", tmp_path / "no-resources")
     settings = _settings(tmp_path)
     settings.models_dir.mkdir(parents=True, exist_ok=True)
     (settings.models_dir / "pose_landmarker_full.task").write_bytes(b"0")
 
-    resolved = resolve_mediapipe_model(
+    resolved = models_module.resolve_mediapipe_model(
         "pose", settings=settings, tier="heavy", allow_download=False
     )
     assert resolved.name == "pose_landmarker_full.task"

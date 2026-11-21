@@ -146,3 +146,66 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 - [ ] macOS Apple Silicon 首次打开通过 Gatekeeper，CoreML 状态可见
 - [ ] Linux 安装 WebKitGTK 后窗口正常，缺失时自动降级浏览器
 - [ ] 首启无模型时能完成下载并立即开始分析
+
+---
+
+## 7. 米制（metric）增强的许可决策
+
+对应 `docs/todo-kick-depth-accuracy.md` §7。结论先写：**发行版不内置任何米制权重，
+米制只作为"源码模式可选增强"，默认关闭**。
+
+### 7.1 候选模型与许可
+
+| 候选 | 权重许可 | 能否随发行版分发 | 说明 |
+| --- | --- | --- | --- |
+| VideoPose3D（H36M 微调） | 研究/非商业（Facebook 原仓库声明，数据来自 Human3.6M） | ❌ | 本项目只做 ONNX 导出脚本，权重由使用者自行准备 |
+| MotionBERT | 研究/非商业（原仓库声明 + H36M） | ❌ | 同上；`scripts/export_motionbert_onnx.py` |
+| AGFormer | 研究/非商业（H36M） | ❌ | 契约与上面两者相同（`LIFTER_FILENAMES` 已预留） |
+| RTMPose / RTMO | Apache-2.0（MMPose 生态） | ✅（但体积大） | **已支持**：`DETECT_BODY_ONNX_POSE_MODEL`，属 2D 姿态引擎，不是米制 3D |
+| MediaPipe PoseLandmarker | Apache-2.0 | ✅ | 默认引擎；其 `world_landmarks` 只是"以髋为原点的近似米制"，不是真米制 3D |
+| MeTRAbs（单图米制 3D） | 代码 MIT；权重由作者发布，SMPL-X 系身体模型需另行注册并遵守其研究许可 | ⚠️ 取决于权重来源 | 精度上最接近"真实厘米"，但**强依赖 SMPL-X 网格与相机内参**；体积约 +300~500 MB（含身体模型），Windows 发行版再叠加 torch 后 ≈ +1.5 GB |
+| Multi-HMR / CameraHMR | 研究许可（H36M + 合成数据训练） | ❌ | 单图多人的米制重建；输出也是 SMPL-X 参数，需要同一套身体模型与新渲染链路 |
+
+判定原则：**许可不明的权重一律不进安装包**。收益与风险不对等 —— 内置一次违规分发
+的法律成本远高于"让用户自己下一个权重文件"的体验损失。
+
+精度与体积的取舍（同 `docs/todo-kick-depth-accuracy.md` §7.1 的评估结论）：
+
+| 方案 | 能否给出"真实厘米" | 额外依赖 | 结论 |
+| --- | --- | --- | --- |
+| 现状（MediaPipe + 骨长约束 + 符号先验） | 否（只保证方向与角度） | 无 | 默认路径 |
+| 单目抬升器（VideoPose3D / MotionBERT） | 否（root-relative、无尺度，只取符号） | onnxruntime（已有） | 可选，需自备权重 |
+| MeTRAbs / Multi-HMR（SMPL-X 系） | 是（需相机内参，弱透视下仍有系统偏差） | torch + SMPL-X 身体模型 | **不立项**：体积 +1.5 GB、许可需注册、对"踢腿幅度"的边际收益不如补拍一个正侧机位 |
+
+### 7.2 三种落地形态与取舍
+
+| 形态 | 用户操作 | 体积影响 | 结论 |
+| --- | --- | --- | --- |
+| 内置权重 | 无 | Windows onedir 约 +150~300 MB（含 torch 则 +700 MB 以上） | **不采用**（许可不允许） |
+| 首启自动下载 | 点一下确认 | 安装包不变；离线机器需手动放 | 可采用，但需镜像与失败兜底；当前未实现 |
+| 用户自备 + 源码模式启用 | 放 `models/`，设两个环境变量 | 0 | **当前方案**（见下） |
+
+### 7.3 当前实现：可选 extra + 显式开关
+
+```bash
+pip install -e ".[metric]"                      # 只有源码模式才会装 torch
+export DETECT_BODY_ENABLE_METRIC_ENGINE=1       # 不设这个变量，引擎根本不注册
+export DETECT_BODY_METRIC_MODEL=models/metric-h36m.onnx
+```
+
+- `app/backend/engine/metric_engine.py` 目前**只实现契约与降级路径**：缺依赖/缺权重时
+  `availability()` 为 False、`prepare()` 抛 `EngineUnavailableError`，`select_engine()`
+  自动回落 MediaPipe；即使注册成功，`infer()` 也明确报"推理内核未实现"。
+- 打包脚本不安装 `[metric]` extra，`models/` 里也不会出现 `metric-h36m.onnx`，
+  因此发行产物的体积与许可风险都不变。
+- 深度符号先验的 `model` 后端走的是 ONNX + onnxruntime（`depth_sign.OnnxLifter`），
+  **不需要 torch**；缺权重时自动退回 `temporal`，不影响可用性。
+
+### 7.4 商用前的检查清单
+
+- [ ] 确认所选米制模型的许可允许商用（H36M 训练数据的许可要一并确认）
+- [ ] 若内置权重：更新本文件与 `README` 的许可段落，并在安装包里附许可原文
+- [ ] 若自动下载：加"仅用于研究"的显式确认，并提供关闭入口
+- [ ] 重新采三档基线（见 `docs/benchmark.md` 踢腿专项），确认收益值得体积与合规成本
+
+

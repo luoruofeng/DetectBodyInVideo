@@ -232,13 +232,14 @@ def test_disabled_config_produces_nothing():
 def test_model_mode_without_weights_falls_back_to_temporal(monkeypatch):
     """缺权重必须静默退回时序模式：分析链路不能因为可选模型缺失而失败。"""
     frames = _kick_frames(40)
-    monkeypatch.setattr(depth_sign, "resolve_model_path", lambda config: None)
+    monkeypatch.setattr(depth_sign, "resolve_model_path", lambda config, lifter=None: None)
     signs, report = depth_sign.estimate_depth_signs(
         frames, DepthSignConfig(enabled=True, mode="model"), aspect=ASPECT
     )
     assert report.applied is True
     assert report.mode == "temporal"
-    assert any("未找到抬升模型" in note for note in report.notes)
+    assert report.lifter == depth_sign.resolve_lifter_name()
+    assert any("权重" in note and "退回时序" in note for note in report.notes), report.notes
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +318,24 @@ def test_flip_depth_branch_is_involutive():
 # --------------------------------------------------------------------------- #
 # 端到端
 # --------------------------------------------------------------------------- #
+def test_lift_stage_progress_and_quality_notes():
+    """§2.1 的可观测性：后处理阶段要上报 ``lift``，质检 notes 要能看到符号先验的结论。"""
+    frames = _mirror_leg_depth(_kick_frames(40, peak_deg=70.0))
+    stages: list[tuple[str, str]] = []
+    config = PostProcessConfig(
+        fps=30.0, aspect_ratio=ASPECT, depth_sign=DepthSignConfig(enabled=True)
+    )
+    result = run_postprocess(
+        frames,
+        config,
+        progress=lambda stage, message, done, total: stages.append((stage, message)),
+    )
+    assert ("lift", "修正前后方向") in stages
+    assert result.depth_sign.mode == "temporal"
+    assert result.depth_sign.flips_after <= result.depth_sign.flips_before
+    assert any("深度方向修正" in note for note in result.quality.notes), result.quality.notes
+
+
 def test_postprocess_reports_lift_stage():
     frames = _mirror_leg_depth(_kick_frames(40, peak_deg=70.0))
     config = PostProcessConfig(

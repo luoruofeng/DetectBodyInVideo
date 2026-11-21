@@ -56,11 +56,36 @@ class DownloadTask(BaseModel):
     finishedAt: float | None = None
 
 
+class LifterInfo(BaseModel):
+    """深度符号先验的 model 后端可选的抬升器（§2.4 / §3.1）。
+
+    UI 用它把「深度方向后端 = model」在权重缺失时置灰 —— 不是"能不能点"的问题，
+    而是"点了会静默退回 temporal"，必须在点之前就说清楚。
+    """
+
+    name: str
+    filename: str
+    present: bool
+    path: str = ""
+    receptiveField: int = 0
+
+
 class ModelsPayload(BaseModel):
     models: list[ModelFileInfo] = Field(default_factory=list)
     poseReady: bool = False
     mirrorConfigured: bool = False
     downloads: list[DownloadTask] = Field(default_factory=list)
+    lifters: list[LifterInfo] = Field(default_factory=list)
+
+
+def _lifter_inventory() -> list[LifterInfo]:
+    """抬升器权重清单；任何异常都降级成空列表（模型面板不能因此 500）。"""
+    try:
+        from app.backend.postprocess.depth_sign import lifter_catalog
+
+        return [LifterInfo(**entry) for entry in lifter_catalog()]
+    except Exception:  # noqa: BLE001 - 可选能力，失败不阻塞模型面板
+        return []
 
 
 def model_inventory(settings: Settings) -> list[ModelFileInfo]:
@@ -109,6 +134,7 @@ class ModelDownloadManager:
             poseReady=any(item.present for item in models if item.kind == "pose"),
             mirrorConfigured=bool((self.settings.model_mirror_url or "").strip()),
             downloads=sorted(tasks, key=lambda item: item.startedAt, reverse=True)[:6],
+            lifters=_lifter_inventory(),
         )
 
     def _filename(self, kind: ModelKind, tier: str) -> str:

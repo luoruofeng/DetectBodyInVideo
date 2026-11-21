@@ -289,6 +289,19 @@
 - [ ] 8.3.2 用真实踢腿素材对比 `depth_sign_flips` 与人工标注的矢状面角度误差，把数字补进 `docs/benchmark.md`
 - [ ] 8.3.3 若 `sagittal_motion_share` 高的素材占多数，优先补强「拍摄引导」（§6）而不是继续堆模型
 
+### 8.3.1 后续扩展唯一入口
+
+本节只做到「符号」这一层。**幅度**（踢得多高、伸得多直）、2D 精度、摆动腿与相位、
+机位与多视角、米制方案的完整任务清单在
+[`docs/todo-kick-depth-accuracy.md`](./todo-kick-depth-accuracy.md)，
+两份文档的口径以那份为准（本章不再单独评估）。三个可直接复用的结论：
+
+- 抬升器抽象（`LifterBackend` / `DETECT_BODY_LIFTER`）与 MotionBERT 导出脚本已在该清单 §3 落地；
+- 方向向量软先验（§4）已实现但**默认关闭**：合成素材上权重扫描显示"≤1 px 重投影预算内拿不到 −30%"，
+  数值见 `docs/benchmark.md`「§4 方向向量先验的权衡曲线」；
+- 踢腿专项指标（`sign_accuracy` / `kick_sagittal_error_deg` / `kick_phase_max_frame_error`）
+  也见 `docs/benchmark.md`「踢腿专项」。
+
 ### 8.4 明确不做
 
 - 不用 VideoPose3D 的输出替代主链坐标：它 root-relative、无尺度、无手脚、无全局朝向，且 H36M 权重**仅限非商业研究**（与 §7 对 HMR 的判断一致）

@@ -36,7 +36,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -50,16 +50,39 @@ from app.backend.postprocess.ik_fit import (
 )
 from app.backend.skeleton.topology import BONE_SEGMENTS, node_map
 
+if TYPE_CHECKING:  # 仅类型标注：运行期不引入 swing → depth_sign 的反向依赖
+    from app.backend.postprocess.swing import KickPhaseReport
+
 logger = get_logger("postprocess.depth_sign")
 
-# 符号图：``{帧号: {骨段 key: (符号, 置信度)}}``。ik_fit 只依赖这个结构，
+# 符号图：``{帧号: {骨段 key: (符号, 置信度[, 方向向量])}}``。ik_fit 只依赖这个结构，
 # 不 import 本模块 —— 保持"拟合层不认识先验来源"的解耦。
-SignMap = dict[int, dict[str, tuple[int, float]]]
+# 第三项（§4 的方向线段）是可选的：两元组仍然完全合法，旧调用方/单测不用改。
+SignEntry = tuple[int, float] | tuple[int, float, np.ndarray]
+SignMap = dict[int, dict[str, SignEntry]]
 
 # 少于这么多帧就不给符号：时序投票没有样本，等同于乱猜。
 MIN_SEQUENCE_FRAMES = 30
 
+LifterName = Literal["videopose3d", "motionbert", "agformer"]
+
 ONNX_MODEL_FILENAME = "videopose3d-h36m.onnx"
+
+# 抬升器 → 权重文件名。三者输入输出契约相同（``[T,17,2] → [T,17,3]``，H36M 17 点），
+# 所以后端实现只有一份，差别只在权重与感受野。
+LIFTER_FILENAMES: dict[str, str] = {
+    "videopose3d": "videopose3d-h36m.onnx",
+    "motionbert": "motionbert-h36m.onnx",
+    "agformer": "agformer-h36m.onnx",
+}
+
+# 感受野（帧）：不足时按边缘复制填充。VideoPose3D 的 243 帧来自 5 层 conv 的叠加；
+# MotionBERT 是 transformer，窗口长度由权重决定，128 是官方 H36M 配置的常用值。
+LIFTER_RECEPTIVE_FIELDS: dict[str, int] = {
+    "videopose3d": 243,
+    "motionbert": 128,
+    "agformer": 128,
+}
 
 # H36M 17 关节顺序（VideoPose3D / Human3.6M 通用约定）
 # 0=hip(pelvis) 1=rhip 2=rknee 3=rankle 4=lhip 5=lknee 6=lankle 7=spine
@@ -141,6 +164,14 @@ class DepthSignConfig(BaseModel):
     auto_calibrate: bool = Field(
         True, description="用同段视频的 world z 符号一致率自动判断是否镜像/丢弃模型结果"
     )
+    emit_direction: bool = Field(
+        True,
+        description="§4：向 ik_fit 提供「方向线段」（符号校正后的单位骨段方向）。"
+        "ik_fit 的 depth_direction_weight=0 时它不产生任何影响，所以默认开启",
+    )
+    direction_min_confidence: float = Field(
+        0.5, ge=0, le=1, description="低于该置信度的骨段不给方向（支撑腿被折扣后通常就落在这里）"
+    )
 
 
 class DepthSignReport(BaseModel):
@@ -154,6 +185,19 @@ class DepthSignReport(BaseModel):
     flips_after: int = Field(0, description="平滑后下发符号的翻转次数")
     disagreements: int = Field(0, description="平滑结果与原始观测符号相反的样本数")
     milliseconds: float = 0.0
+    lifter: str = Field("", description="model 模式实际使用的抬升器（videopose3d / motionbert / agformer）")
+    auto_calibrate_ratio: float | None = Field(
+        None, ge=0, le=1, description="自校准一致率（0~1）；None = 未做自校准（temporal 模式 / 样本不足）"
+    )
+    calibration: Literal["inactive", "skipped", "passed", "inverted", "discarded"] = Field(
+        "inactive",
+        description="自校准结论：passed 通过 / inverted 深度轴镜像已取反 / "
+        "discarded 判定无效 / skipped 样本不足或未启用",
+    )
+    direction_segments: int = Field(
+        0, description="§4 方向向量先验生效的 (帧 × 骨段) 数量；0 = 只有符号（hinge）"
+    )
+    swing_leg: str = Field("none", description="§5.2 摆动腿识别结果（left / right / none）")
     notes: list[str] = Field(default_factory=list)
 
 
@@ -310,13 +354,144 @@ def _temporal_signals(
 # --------------------------------------------------------------------------- #
 # 后端 2：可选 ONNX 抬升器（只取符号）
 # --------------------------------------------------------------------------- #
-def resolve_model_path(config: DepthSignConfig) -> str | None:
-    """显式路径 → ``models_dir`` → 打包资源根 ``models/``。找不到返回 None。"""
+@runtime_checkable
+class LifterBackend(Protocol):
+    """抬升器后端契约：任何失败都要能被调用方静默降级，不能抛到分析主链。
+
+    输入输出契约固定为 ``[T,17,2] → [T,17,3]``（H36M 17 点、根相对），因此
+    VideoPose3D / MotionBERT / AGFormer 可以互换；``depth_sign`` 只读 Δz 的符号。
+    """
+
+    name: str
+    receptive_field: int
+
+    def availability(self) -> tuple[bool, str]:
+        ...
+
+    def load(self) -> None:
+        ...
+
+    def infer(self, sequence: np.ndarray) -> np.ndarray:
+        ...
+
+    @property
+    def providers(self) -> list[str]:
+        ...
+
+
+class OnnxLifter:
+    """单个 ONNX 抬升器的通用实现（各 lifter 只差权重与感受野）。"""
+
+    def __init__(self, name: str, path: str | None, *, receptive_field: int | None = None) -> None:
+        self.name = name
+        self.path = path
+        self.receptive_field = int(
+            receptive_field or LIFTER_RECEPTIVE_FIELDS.get(name, 243)
+        )
+        self._session: object | None = None
+        self._input_name = "pose2d"
+        self._window: int | None = None
+        self._providers: list[str] = []
+
+    # ---- 生命周期 ----
+    def availability(self) -> tuple[bool, str]:
+        if not self.path:
+            return False, f"未找到 {self.name} 权重（{LIFTER_FILENAMES.get(self.name, '')}）"
+        try:
+            import onnxruntime  # noqa: F401, PLC0415 - 仅探测依赖
+        except Exception as exc:  # pragma: no cover - 依赖缺失
+            return False, f"onnxruntime 不可用（{exc}）"
+        return True, ""
+
+    def load(self) -> None:
+        import onnxruntime as ort  # noqa: PLC0415
+
+        from app.backend.engine.acceleration import onnx_execution_providers  # noqa: PLC0415
+
+        self._providers = onnx_execution_providers()
+        self._session = ort.InferenceSession(self.path, providers=self._providers)
+        session = self._session
+        if session is None:  # pragma: no cover - 理论不可达
+            raise RuntimeError("会话未创建")
+        inputs = session.get_inputs()  # type: ignore[attr-defined]
+        self._input_name = inputs[0].name
+        shape = list(inputs[0].shape)
+        # 固定长度输入（部分导出把 T 烘死）→ 按窗口切分；动态维度则整段一次推理
+        length = shape[1] if len(shape) > 1 else None
+        self._window = int(length) if isinstance(length, int) and length > 0 else None
+
+    @property
+    def providers(self) -> list[str]:
+        return list(self._providers)
+
+    # ---- 推理 ----
+    def _run(self, sequence: np.ndarray) -> np.ndarray:
+        session = self._session
+        if session is None:
+            raise RuntimeError("抬升器未 load()")
+        output = session.run(None, {self._input_name: sequence[None, ...]})[0]  # type: ignore[attr-defined]
+        if output.ndim == 4:
+            output = output[0]
+        if output.ndim != 3 or output.shape[1] != 17 or output.shape[2] != 3:
+            raise ValueError(f"抬升器输出形状不符：{tuple(output.shape)}，期望 [T,17,3]")
+        if not np.all(np.isfinite(output)):
+            raise ValueError("抬升器输出含 NaN/Inf")
+        return np.asarray(output, dtype=np.float64)
+
+    def infer(self, sequence: np.ndarray) -> np.ndarray:
+        """``[T,17,2] → [T,17,3]``。不足感受野时边缘复制填充，固定窗口模型按窗切分。"""
+        count = int(sequence.shape[0])
+        if count == 0:
+            return np.zeros((0, 17, 3), dtype=np.float64)
+        window = self._window or max(1, self.receptive_field)
+        if self._window is None and count <= self.receptive_field:
+            pad = self.receptive_field - count
+            padded = np.pad(sequence, ((pad // 2, pad - pad // 2), (0, 0), (0, 0)), mode="edge")
+            return self._run(padded)[pad // 2 : pad // 2 + count]
+
+        stride = max(1, window // 2)
+        outputs = np.zeros((count, 17, 3), dtype=np.float64)
+        weights = np.zeros((count, 1, 1), dtype=np.float64)
+        start = 0
+        while start < count:
+            end = min(count, start + window)
+            chunk = sequence[start:end]
+            pad = window - chunk.shape[0]
+            if pad:
+                # 最后一窗不足时边缘复制（比零填充更接近训练分布）
+                chunk = np.pad(chunk, ((0, pad), (0, 0), (0, 0)), mode="edge")
+            result = self._run(chunk)[: end - start]
+            outputs[start:end] += result
+            weights[start:end] += 1.0
+            if end >= count:
+                break
+            start += stride
+        return outputs / np.maximum(weights, 1e-9)
+
+
+def resolve_lifter_name(config: DepthSignConfig | None = None) -> str:
+    """当前抬升器名：环境变量/配置（``DETECT_BODY_LIFTER``）优先，缺配置时用 videopose3d。"""
+    try:
+        from app.backend.core.settings import get_settings
+
+        return str(get_settings().lifter)
+    except Exception:  # pragma: no cover - 配置不可用
+        return "videopose3d"
+
+
+def resolve_model_path(config: DepthSignConfig, lifter: str | None = None) -> str | None:
+    """显式路径 → ``models_dir`` → 打包资源根 ``models/``。找不到返回 None。
+
+    查找顺序对所有 lifter 一致，只是文件名随 ``DETECT_BODY_LIFTER`` 变化
+    （``videopose3d-h36m.onnx`` / ``motionbert-h36m.onnx`` / ``agformer-h36m.onnx``）。
+    """
     from pathlib import Path
 
     if config.model_path:
         path = Path(config.model_path)
         return str(path) if path.is_file() else None
+    name = lifter or resolve_lifter_name(config)
+    filename = LIFTER_FILENAMES.get(name, ONNX_MODEL_FILENAME)
     try:
         from app.backend.core.settings import get_settings
 
@@ -324,13 +499,31 @@ def resolve_model_path(config: DepthSignConfig) -> str | None:
     except Exception:  # pragma: no cover - 配置不可用的极端情况
         return None
     candidates = [
-        Path(settings.models_dir) / ONNX_MODEL_FILENAME,
-        Path(settings.static_dir).parents[2] / "models" / ONNX_MODEL_FILENAME,
+        Path(settings.models_dir) / filename,
+        Path(settings.static_dir).parents[2] / "models" / filename,
     ]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def lifter_catalog(config: DepthSignConfig | None = None) -> list[dict[str, object]]:
+    """可选的抬升器与权重就绪情况（供 UI 把 ``model`` 档置灰）。"""
+    config = config or DepthSignConfig()
+    entries: list[dict[str, object]] = []
+    for name, filename in LIFTER_FILENAMES.items():
+        path = resolve_model_path(config, name)
+        entries.append(
+            {
+                "name": name,
+                "filename": filename,
+                "present": path is not None,
+                "path": path or "",
+                "receptiveField": LIFTER_RECEPTIVE_FIELDS.get(name, 243),
+            }
+        )
+    return entries
 
 
 def _h36m_input(
@@ -387,63 +580,43 @@ def _h36m_input(
     return np.asarray(sequence, dtype=np.float32), frame_indices, confidences
 
 
+def build_lifter_backend(
+    config: DepthSignConfig, *, lifter: str | None = None
+) -> LifterBackend:
+    """按 ``DETECT_BODY_LIFTER`` 构造抬升器后端（权重缺失时也返回对象，由调用方降级）。"""
+    name = lifter or resolve_lifter_name(config)
+    return OnnxLifter(name, resolve_model_path(config, name))
+
+
 def _model_signals(
     frames: Sequence[PoseFrame],
     config: DepthSignConfig,
     aspect: float,
     notes: list[str],
+    *,
+    backend: LifterBackend | None = None,
 ) -> tuple[dict[str, list[tuple[int, int, float]]], int]:
     """跑 ONNX 抬升器，返回符号信号与参与帧数；任何失败都返回空并写 note。"""
-    path = resolve_model_path(config)
-    if not path:
-        notes.append(
-            f"未找到抬升模型（{ONNX_MODEL_FILENAME}），本次退回时序一致性模式；"
-            "可用 scripts/export_videopose3d_onnx.py 离线导出权重"
-        )
-        return {}, 0
-    try:
-        import onnxruntime as ort
-    except Exception as exc:  # pragma: no cover - 依赖缺失
-        notes.append(f"onnxruntime 不可用（{exc}），退回时序一致性模式")
+    lifter = backend or build_lifter_backend(config)
+    available, reason = lifter.availability()
+    if not available:
+        notes.append(f"{reason}，本次退回时序一致性模式；可用 scripts/export_*_onnx.py 离线导出权重")
         return {}, 0
 
     sequence, frame_indices, confidences = _h36m_input(frames, aspect)
     if sequence.shape[0] == 0:
         return {}, 0
 
-    available = set(ort.get_available_providers())
-    providers = [
-        item
-        for item in (
-            "CUDAExecutionProvider",
-            "CoreMLExecutionProvider",
-            "DmlExecutionProvider",
-            "CPUExecutionProvider",
-        )
-        if item in available
-    ]
     try:
-        session = ort.InferenceSession(path, providers=providers or ["CPUExecutionProvider"])
-        input_name = session.get_inputs()[0].name
-        # 感受野 243 帧：不足时用边缘复制填充，保证每一帧都在"有上下文"的位置上被推断
-        receptive = 243
-        pad = max(0, receptive - sequence.shape[0])
-        padded = (
-            np.pad(sequence, ((pad // 2, pad - pad // 2), (0, 0), (0, 0)), mode="edge")
-            if pad
-            else sequence
-        )
-        output = session.run(None, {input_name: padded[None, ...]})[0]
-        if output.ndim == 4:
-            output = output[0]
-        if pad:
-            output = output[pad // 2 : pad // 2 + sequence.shape[0]]
-    except Exception as exc:  # pragma: no cover - 权重损坏 / 形状不符
+        lifter.load()
+        output = lifter.infer(sequence)
+    except Exception as exc:  # pragma: no cover - 权重损坏 / 形状不符 / EP 异常
         notes.append(f"抬升模型推理失败（{exc}），退回时序一致性模式")
         return {}, 0
 
     notes.append(
-        f"抬升模型：{path}（{','.join(providers) or 'CPU'}），只取深度符号，幅度与尺度一律丢弃"
+        f"抬升模型：{lifter.name}（{','.join(lifter.providers) or 'CPU'}，"
+        f"感受野 {lifter.receptive_field} 帧），只取深度符号，幅度与尺度一律丢弃"
     )
 
     nodes = node_map()
@@ -476,8 +649,12 @@ def _calibrate_model_signs(
     reference: dict[str, list[tuple[int, int, float]]],
     config: DepthSignConfig,
     notes: list[str],
-) -> dict[str, list[tuple[int, int, float]]]:
-    """用同段视频的 world z 符号做一致性校准（自动判镜像 / 判无效）。"""
+) -> tuple[dict[str, list[tuple[int, int, float]]], float | None, str]:
+    """用同段视频的 world z 符号做一致性校准（自动判镜像 / 判无效）。
+
+    返回 ``(符号, 一致率, 结论)``；一致率与结论同时进 ``DepthSignReport``，
+    这样消费方（UI / 基准脚本）不必去解析 ``notes`` 里的中文句子。
+    """
     reference_signs = {
         key: {frame_index: sign for frame_index, sign, _ in values}
         for key, values in reference.items()
@@ -493,45 +670,129 @@ def _calibrate_model_signs(
             total += 1
             agree += 1 if other == sign else 0
     if total < 12:
-        return model
+        notes.append(f"自校准样本不足（{total} < 12），本次不校核方向")
+        return model, None, "skipped"
     ratio = agree / total
     if not config.auto_calibrate:
         if config.depth_axis_inverted:
             for key, values in model.items():
                 model[key] = [(index, -sign, weight) for index, sign, weight in values]
         notes.append(f"未启用自校准：模型与 world z 的符号一致率 {ratio:.0%}")
-        return model
+        return model, round(ratio, 4), "skipped"
     if ratio < 0.3:
         for key, values in model.items():
             model[key] = [(index, -sign, weight) for index, sign, weight in values]
         notes.append(
             f"抬升模型与 world z 的符号一致率仅 {ratio:.0%}，判定为深度轴镜像，已整体取反"
         )
-        return model
+        logger.debug("自校准：一致率 %.3f → 整体取反", ratio)
+        return model, round(ratio, 4), "inverted"
     if ratio < 0.55:
         notes.append(
             f"抬升模型与 world z 的符号一致率 {ratio:.0%} 接近随机，判定无效，退回时序一致性模式"
         )
-        return {}
+        logger.debug("自校准：一致率 %.3f → 判定无效", ratio)
+        return {}, round(ratio, 4), "discarded"
     notes.append(f"抬升模型与 world z 的符号一致率 {ratio:.0%}，自校准通过")
-    return model
+    logger.debug("自校准：一致率 %.3f → 通过", ratio)
+    return model, round(ratio, 4), "passed"
 
 
 # --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
+LEG_BONE_SUFFIXES: tuple[str, ...] = ("knee", "ankle", "heel", "foot_index")
+
+# 支撑腿的符号置信度折扣（§5.2）：站直的腿 Δz≈0，"往前还是往后"基本是噪声，
+# 强推它只会把腿掰弯。摆动腿保持原值，支撑腿按这个比例削弱。
+SUPPORT_LEG_CONFIDENCE_SCALE = 0.45
+
+
+def _sign_confidence(
+    key: str,
+    frame_index: int,
+    confidence: float,
+    swing_leg: str,
+    phases: KickPhaseReport | None,
+) -> float:
+    """按"摆动腿 / 相位"给符号置信度加权（§5.2 / §5.3）。
+
+    只影响**先验的力度**，不影响符号本身；关掉摆动腿识别时这里恒为 1.0，
+    因此与改造前的行为逐位一致。
+    """
+    scale = 1.0
+    if swing_leg in ("left", "right") and key.endswith(LEG_BONE_SUFFIXES):
+        side = key.split("_", 1)[0]
+        if side in ("left", "right") and side != swing_leg:
+            scale *= SUPPORT_LEG_CONFIDENCE_SCALE
+    if phases is not None and getattr(phases, "detected", False):
+        from app.backend.postprocess.swing import direction_weight_scale
+
+        scale *= direction_weight_scale(frame_index, phases)
+    return min(1.0, max(0.0, confidence * scale))
+
+
+def _bone_direction(
+    positions: dict[str, np.ndarray] | None, key: str, sign: int
+) -> np.ndarray | None:
+    """符号校正后的单位骨段方向（"方向线段"）：先按先验定住 z 的正负，再归一化。"""
+    if not positions:
+        return None
+    node = node_map().get(key)
+    if node is None or not node.parent:
+        return None
+    child = positions.get(key)
+    parent = positions.get(node.parent)
+    if child is None or parent is None:
+        return None
+    vector = np.array(child, dtype=np.float64) - np.array(parent, dtype=np.float64)
+    if sign and float(vector[2]) * sign < 0:
+        vector[2] = -vector[2]
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9:
+        return None
+    return vector / norm
+
+
+def _smooth_directions(
+    directions: dict[int, np.ndarray], window: int
+) -> dict[int, np.ndarray]:
+    """对方向线段做时间窗平均（向量平均后重新归一化）。
+
+    只改方向、不改长度，也不改变符号先验：符号仍由 ``_vote`` 的多数投票决定。
+    """
+    if len(directions) < 2 or window <= 1:
+        return directions
+    indices = sorted(directions)
+    half = max(1, int(window) // 2)
+    smoothed: dict[int, np.ndarray] = {}
+    for position, frame_index in enumerate(indices):
+        start = max(0, position - half)
+        end = min(len(indices), position + half + 1)
+        total = np.zeros(3, dtype=np.float64)
+        for neighbor in indices[start:end]:
+            total += directions[neighbor]
+        norm = float(np.linalg.norm(total))
+        if norm > 1e-9:
+            smoothed[frame_index] = total / norm
+    return smoothed
+
+
 def estimate_depth_signs(
     frames: Sequence[PoseFrame],
     config: DepthSignConfig | None = None,
     *,
     lengths: BoneLengths | None = None,
     aspect: float = 9 / 16.0,
+    swing_leg: str = "none",
+    phases: KickPhaseReport | None = None,
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[SignMap, DepthSignReport]:
     """生成 ``{帧号: {骨段: (符号, 置信度)}}``。任何异常都退回"不给符号"，绝不中断分析。"""
     config = config or DepthSignConfig()
     report = DepthSignReport(mode=config.mode if config.enabled else "off")
+    report.swing_leg = swing_leg or "none"
     ordered = sorted(frames, key=lambda item: item.index)
     report.frames = len(ordered)
     if not config.enabled:
@@ -559,15 +820,24 @@ def estimate_depth_signs(
     signals = reference
     used_model = False
     if config.mode == "model":
-        model_signals, used_frames = _model_signals(ordered, config, aspect, notes)
+        backend = build_lifter_backend(config)
+        report.lifter = backend.name
+        model_signals, used_frames = _model_signals(
+            ordered, config, aspect, notes, backend=backend
+        )
         if model_signals:
-            model_signals = _calibrate_model_signs(model_signals, reference, config, notes)
+            model_signals, ratio, verdict = _calibrate_model_signs(
+                model_signals, reference, config, notes
+            )
+            report.auto_calibrate_ratio = ratio
+            report.calibration = verdict  # type: ignore[assignment]
             if model_signals:
                 signals = model_signals
                 used_model = True
                 report.mode = "model"
                 notes.append(f"抬升覆盖 {used_frames} 帧")
         if not used_model:
+            # mode 如实回传 temporal；lifter 保留"尝试过哪个"，便于排查是权重缺失还是判定无效
             report.mode = "temporal"
 
     if config.swap_left_right and used_model:
@@ -584,6 +854,17 @@ def estimate_depth_signs(
     flips_before = 0
     flips_after = 0
     disagreements = 0
+    direction_segments = 0
+    # 方向线段只在开启时才取一遍世界坐标（关闭时这一步是纯开销）
+    positions_by_frame: dict[int, dict[str, np.ndarray]] = (
+        {
+            frame.index: node_positions(frame.world_landmarks)
+            for frame in ordered
+            if frame.valid and len(frame.world_landmarks) >= LANDMARK_COUNT
+        }
+        if config.emit_direction
+        else {}
+    )
     raw_signs = {
         key: {frame_index: sign for frame_index, sign, _ in values}
         for key, values in signals.items()
@@ -605,18 +886,58 @@ def estimate_depth_signs(
             min_run=config.min_run,
         )
         if not voted:
+            # §8.3：丢弃必须可诊断 —— 否则"某根骨段没被修正"只能靠猜
+            logger.debug(
+                "骨段 %s 被丢弃：%d 帧样本的一直率不足以通过 min_agreement=%.2f / min_run=%d",
+                key,
+                len(values),
+                config.min_agreement,
+                config.min_run,
+            )
             continue
         smoothed = sorted(voted.items())
         flips_after += _count_flips([(index, sign) for index, (sign, _) in smoothed])
+        if logger.isEnabledFor(10):  # DEBUG
+            agree = np.mean([confidence for _sign, confidence in smoothed])
+            flips_key = _count_flips([(index, sign) for index, (sign, _) in smoothed])
+            drop = len(values) - len(smoothed)
+            logger.debug(
+                "骨段 %s：%d/%d 帧通过投票（平均一致率 %.2f，翻转 %d，丢弃 %d）",
+                key,
+                len(smoothed),
+                len(values),
+                float(agree),
+                flips_key,
+                drop,
+            )
         observed = raw_signs.get(key) or {}
+        # 方向线段是**时序**概念：逐帧把观测方向当目标，会把"朝前"抖成"朝侧"。
+        # 所以先按帧取符号校正后的单位方向，再在同一时间窗内做平均（分母 1 归一化）。
+        directions: dict[int, np.ndarray] = {}
+        if config.emit_direction:
+            for frame_index, (sign, confidence) in voted.items():
+                weight = _sign_confidence(key, frame_index, confidence, swing_leg, phases)
+                if weight < config.direction_min_confidence:
+                    continue
+                vector = _bone_direction(positions_by_frame.get(frame_index), key, int(sign))
+                if vector is not None:
+                    directions[frame_index] = vector
+            directions = _smooth_directions(directions, config.window)
         for frame_index, (sign, confidence) in voted.items():
-            sign_map.setdefault(frame_index, {})[key] = (int(sign), float(confidence))
+            weight = _sign_confidence(key, frame_index, confidence, swing_leg, phases)
+            entry: tuple[object, ...] = (int(sign), float(weight))
+            direction = directions.get(frame_index)
+            if direction is not None:
+                entry = (int(sign), float(weight), direction)
+                direction_segments += 1
+            sign_map.setdefault(frame_index, {})[key] = entry  # type: ignore[index]
             if observed.get(frame_index) not in (None, sign):
                 disagreements += 1
         if progress is not None:
             progress(order + 1, per_key_total)
 
     report.applied = bool(sign_map)
+    report.direction_segments = direction_segments
     report.segments = sum(len(value) for value in sign_map.values())
     report.flips_before = flips_before
     report.flips_after = flips_after
@@ -636,11 +957,19 @@ def estimate_depth_signs(
 __all__ = [
     "H36M_TO_NODE",
     "LIFTABLE_KEYS",
+    "LIFTER_FILENAMES",
+    "LIFTER_RECEPTIVE_FIELDS",
     "MIN_SEQUENCE_FRAMES",
     "ONNX_MODEL_FILENAME",
     "DepthSignConfig",
     "DepthSignReport",
+    "LifterBackend",
+    "LifterName",
+    "OnnxLifter",
     "SignMap",
+    "build_lifter_backend",
     "estimate_depth_signs",
+    "lifter_catalog",
+    "resolve_lifter_name",
     "resolve_model_path",
 ]
