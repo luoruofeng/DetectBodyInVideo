@@ -12,6 +12,14 @@
 6. ``sagittal_motion_share`` 四肢顺着镜头方向伸展的帧占比，是上面那个歧义能否被
    观测到的**拍摄期**判据（越高说明越该补拍侧视机位）。
 
+直立姿态专项（"正对镜头站立却解出躯干/头部前倾"）：
+
+9. ``head_forward_abs_meters`` / ``torso_pitch_signed_deg`` —— ``head_joint`` 相对颈轴的
+   z 偏移与躯干俯仰角。正面直立素材上两者中位数都应当 ≈ 0；头那一项一旦稳定偏离 0，
+   说明 ``ik_fit.calibrate_bone_lengths`` 的头骨段解剖封顶或 ``ik_fit.head_depth`` 的
+   深度目标失效了（``head_joint`` 的深度由鼻尖反推，见 ``skeleton.mapping``）。
+   导出的逐帧读数同名指标是 ``angles.head_lean``（矢状面角度，个位数度数为正常）。
+
 踢腿专项（``docs/todo-kick-depth-accuracy.md`` §1.3）：
 
 7. ``sign_accuracy`` 与人工标注（``--labels``）比对每根骨段 ``sign(Δz)`` 的正确率，
@@ -31,6 +39,7 @@
 
     # A/B：关掉本次新增的处理，看指标是否真的变化
     python scripts/bench_depth.py --synthetic --no-ik-fit --no-z-smoothing
+    python scripts/bench_depth.py --synthetic --no-head-depth   # 头前探指标应当劣化
 
     # 踢腿验收：三档深度后端 + 人工标注
     python scripts/bench_depth.py samples/benchmark/BM-05-front-kick.mp4 \\
@@ -80,6 +89,9 @@ REGRESSION_LIMITS: dict[str, float] = {
     "sign_accuracy": 0.10,
     "kick_sagittal_error_thigh_mean_deg": 0.20,
     "kick_sagittal_error_shank_mean_deg": 0.20,
+    # 理想值是 0，"越大越差"；只看绝对值，符号由 head_forward_meters 单独看
+    "head_forward_abs_meters": 0.50,
+    "head_forward_abs_p90_meters": 0.50,
 }
 
 # 这些指标"越大越好"，判定方向要反过来（否则符号准确率上升会被标成劣化）
@@ -545,6 +557,59 @@ def kick_phase_error(
     return {"frameError": result, "maxFrameError": max(result.values())}
 
 
+def head_torso_alignment(frames: Sequence[PoseFrame]) -> dict[str, float]:
+    """直立姿态检查：头相对颈轴的深度偏移、躯干俯仰角。
+
+    单列这一项的原因：正面机位下**头的前后位置完全没有观测**，它只能靠先验落在
+    颈正上方；这个先验由「头骨段解剖封顶（``ik_fit.calibrate_bone_lengths``）+
+    ``ik_fit.head_depth.target_forward_meters`` + ``mapping`` 里由鼻尖反推 head_joint 深度」
+    三层共同表达，任何一层失效这里都会稳定偏离 0，而不是像其它指标那样只是抖动变大。
+
+    - ``head_forward_meters``：``head_joint.z - neck_1_joint.z`` 的中位数（负 = 头朝镜头探）；
+    - ``head_forward_abs_meters``：同上取绝对值后的中位数，正面直立素材应当 < 0.02；
+    - ``head_forward_abs_p90_meters``：绝对值 p90，用来看"偶尔几帧突然前探"；
+    - ``torso_pitch_signed_deg``：躯干俯仰中位数（正 = 肩比髋更靠镜头）。
+
+    取的是 ``skeleton.mapping`` 的输出而不是 world_landmarks，因为 3D 预览/导出的
+    ``head_joint`` 就是那一层算出来的 —— 指标必须和用户看到的东西同源。
+    """
+    from app.backend.skeleton.mapping import map_frame
+
+    forward: list[float] = []
+    pitch: list[float] = []
+    for frame in sorted(frames, key=lambda item: item.index):
+        if not frame.valid or len(frame.world_landmarks) < LANDMARK_COUNT:
+            continue
+        skeleton = map_frame(frame, use_world=True)
+        head = skeleton.joints.get("head_joint")
+        neck = skeleton.joints.get("neck_1_joint")
+        if head is not None and neck is not None and math.isfinite(head.z - neck.z):
+            forward.append(head.z - neck.z)
+        value = compute_angles(frame).get("torso_pitch_signed_deg")
+        if value is not None and math.isfinite(value):
+            pitch.append(float(value))
+    if not forward:
+        return {
+            "head_forward_meters": 0.0,
+            "head_forward_abs_meters": 0.0,
+            "head_forward_abs_p90_meters": 0.0,
+            "torso_pitch_signed_deg": 0.0,
+            "frames": 0,
+        }
+    values = np.asarray(forward, dtype=np.float64)
+    return {
+        "head_forward_meters": round(float(np.median(values)), 6),
+        "head_forward_abs_meters": round(float(np.median(np.abs(values))), 6),
+        "head_forward_abs_p90_meters": round(
+            float(np.percentile(np.abs(values), 90)), 6
+        ),
+        "torso_pitch_signed_deg": (
+            round(float(np.median(pitch)), 4) if pitch else 0.0
+        ),
+        "frames": len(values),
+    }
+
+
 def reprojection_summary(
     frames: Sequence[PoseFrame], *, aspect: float, width: float, height: float
 ) -> dict[str, float]:
@@ -680,6 +745,11 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
         sparsity = getattr(args, "direction_sparsity", 0.0)
         if sparsity and hasattr(postprocess.ik_fit, "depth_sparsity_weight"):
             fit_update["depth_sparsity_weight"] = float(sparsity)
+        # 头部专项 A/B：关掉后 head_forward_* 应当明显劣化（回到"直立也有几厘米前探"）
+        if getattr(args, "no_head_depth", False) and hasattr(postprocess.ik_fit, "head_depth"):
+            fit_update["head_depth"] = postprocess.ik_fit.head_depth.model_copy(
+                update={"enabled": False}
+            )
         postprocess = postprocess.model_copy(
             update={"ik_fit": postprocess.ik_fit.model_copy(update=fit_update)}
         )
@@ -844,6 +914,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "angle_drift_deg": angle_drift(frames),
         "depth_sign_flips": depth_sign_flips(frames),
         "sagittal_motion_share": sagittal_motion_share(frames, aspect=aspect),
+        "head_torso": head_torso_alignment(frames),
         "timing": timing,
         "env": {
             "platform": f"{platform.system()} / {platform.machine()}",
@@ -920,6 +991,15 @@ def _flat(metrics: dict[str, Any]) -> dict[str, float]:
     flat["angle_drift_deg"] = float((metrics.get("angle_drift_deg") or {}).get("mean", 0.0))
     flat["depth_sign_flips"] = float((metrics.get("depth_sign_flips") or {}).get("total", 0))
     flat["sagittal_motion_share"] = float(metrics.get("sagittal_motion_share") or 0.0)
+    head = metrics.get("head_torso") or {}
+    for key in (
+        "head_forward_meters",
+        "head_forward_abs_meters",
+        "head_forward_abs_p90_meters",
+        "torso_pitch_signed_deg",
+    ):
+        if head.get(key) is not None:
+            flat[key] = float(head[key])
     yaw = metrics.get("yaw") or {}
     for key, source in (
         ("yaw_error_width_deg", "width_error_deg"),
@@ -1022,6 +1102,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", default="", help="把本次结果写到该 JSON 路径")
     parser.add_argument("--baseline", default="", help="上一次结果的 JSON，用于 diff 回归检测")
     parser.add_argument("--no-ik-fit", action="store_true", help="关闭骨长约束拟合（A/B）")
+    parser.add_argument(
+        "--no-head-depth",
+        action="store_true",
+        help="关闭头部深度专项（A/B）：head_forward_abs_meters 应当明显变大",
+    )
     parser.add_argument("--no-z-smoothing", action="store_true", help="关闭 z 轴强平滑（A/B）")
     parser.add_argument("--no-smoothing", action="store_true", help="完全关闭平滑（A/B）")
     parser.add_argument(

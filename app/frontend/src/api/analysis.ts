@@ -180,6 +180,12 @@ export interface PreviewFrame {
   bbox: BoundingBox | null
   /** 髋到最低着地点的竖直距离（米，后端已做零相位平滑）；预览直接用它把脚底放到地面 */
   hipHeight?: number | null
+  /**
+   * 髋相对双脚水平基准点的偏移（米，后端已做零相位平滑）。
+   * 关节是髋局部坐标，不加上这个偏移，原地站立时脚会跟着髋在地面上滑动。
+   */
+  hipOffsetX?: number
+  hipOffsetZ?: number
 }
 
 export interface FramesPayload {
@@ -271,6 +277,21 @@ export interface DepthSignOptions {
   swapLeftRight?: boolean
 }
 
+/** 直立基准校准：正对静止片段的躯干 z 偏置扣除（门控不满足时自动跳过）。 */
+export interface UprightBaselineOptions {
+  enabled?: boolean
+  /** 只看开头多少帧来估计基准 */
+  window?: number
+  /** 至少多少帧满足正对静止才应用 */
+  min_frames?: number
+  /** 观测宽度比高于该值视为正对 */
+  frontal_ratio?: number
+  /** 相邻帧髋中点的最大 2D 位移（归一化画面高度） */
+  max_motion?: number
+  /** 偏置绝对值上限（米），超过则跳过 */
+  max_bias_meters?: number
+}
+
 /** 引擎侧检测阈值与条件式重跑（§5.1）。 */
 export interface EngineOptions {
   minDetectionConfidence?: number
@@ -298,6 +319,7 @@ export interface KickSummary {
 
 export interface PostprocessOptions {
   depth_sign?: DepthSignOptions
+  upright_baseline?: UprightBaselineOptions
 }
 
 export interface AnalysisOptions {

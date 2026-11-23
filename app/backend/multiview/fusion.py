@@ -38,6 +38,9 @@ FRONTAL_ANGLES: frozenset[str] = frozenset(
     {"left_shoulder", "right_shoulder", "left_elbow", "right_elbow"}
 )
 
+# 有符号俯仰角的正负依赖机位朝向，跨机位直接平均会互相抵消；只作单机位诊断量。
+DIAGNOSTIC_ANGLES: frozenset[str] = frozenset({"torso_pitch_signed_deg"})
+
 # 机位看得"背对"该平面时，权重不会归零（否则一个机位缺失该角度就整帧丢失）
 MIN_PLANE_WEIGHT = 0.15
 
@@ -206,6 +209,8 @@ def fuse_views(
         for view in usable:
             keys.update(view.angles[position].keys() if position < len(view.angles) else set())
         for key in keys:
+            if key in DIAGNOSTIC_ANGLES:
+                continue
             weighted = 0.0
             weight_sum = 0.0
             for view in usable:
@@ -273,6 +278,7 @@ def view_from_frames(
 
 
 __all__ = [
+    "DIAGNOSTIC_ANGLES",
     "FRONTAL_ANGLES",
     "FusedAngleSeries",
     "FusionConfig",

@@ -38,11 +38,16 @@ const HAND_HOLD_SECONDS = 0.4
 const HAND_RELAX_SECONDS = 0.18
 /** 每帧向观测值靠拢的比例；播放时的手部高频抖动会被抹平。 */
 const HAND_SHAPE_SMOOTHING = 0.35
-/** 单节指骨长度偏离默认值过多 → 认为这一帧的整根手指不可信。 */
-const HAND_BONE_MIN_RATIO = 0.45
-const HAND_BONE_MAX_RATIO = 1.9
-/** 关键点噪声量级（米）：短骨（指尖外推那一节）按绝对容差放宽。 */
-const HAND_BONE_SLACK = 0.005
+/**
+ * 观测到的整根手指跨度（掌指 → 指尖）相对默认手型的合理区间。
+ * 超出说明这一帧的关键点整体塌陷/炸开，只保留上一手型，免得手指乱摆。
+ * 注意判据只有"整体跨度"一项：单节指骨的长度在远景下本来就抖得厉害，
+ * 拿它逐节卡容差会让整根手指被反复丢弃（表现为白膜手指一动都不动）。
+ */
+const HAND_SPAN_MIN_RATIO = 0.15
+const HAND_SPAN_MAX_RATIO = 2.5
+/** 掌指关节位置沿用观测值，但与默认位置的偏差按该权重收敛，手指不会飞离手掌。 */
+const HAND_KNUCKLE_WEIGHT = 0.55
 /** 指尖关节（End）由后端从末节方向外推 0.35 节，这里保持一致。 */
 const TIP_END_RATIO = 0.35
 
@@ -92,6 +97,8 @@ interface FingerChainSpec {
   points: THREE.Vector3[]
   /** 每节指骨的半径，长度 = ``points.length - 1``。 */
   radii: number[]
+  /** 默认姿态下近节指骨的方向；观测退化时用它兜底。 */
+  initialDirection: THREE.Vector3
 }
 
 function ellipsoid(rx: number, ry: number, rz: number, widthSegments = 20): THREE.BufferGeometry {
@@ -123,7 +130,8 @@ function buildChain(
 ): FingerChainSpec {
   const points = [start.clone()]
   const radii: number[] = []
-  let direction = initialDirection.clone().normalize()
+  const restDirection = initialDirection.clone().normalize()
+  let direction = restDirection.clone()
   // End 是后端从末节方向外推出来的指尖点，长度只有末节指骨的一小截。
   const lastLength = segments[segments.length - 1] * TIP_END_RATIO
   for (let index = 0; index < parts.length - 1; index += 1) {
@@ -132,7 +140,7 @@ function buildChain(
     radii.push(radius * (1 - 0.14 * index))
     direction = bendToward(direction, PALM_NORMAL, curl[index] ?? curl[curl.length - 1])
   }
-  return { key, parts, points, radii }
+  return { key, parts, points, radii, initialDirection: restDirection }
 }
 
 const CHAINS: readonly FingerChainSpec[] = [
@@ -384,18 +392,51 @@ function blendChains(
   return from.map((point, index) => point.clone().lerp(to[index], ratio))
 }
 
-/** 逐节核对骨长；关键点跳变导致手指被拉长/压扁时整根手指都不用。 */
-function plausible(chain: FingerChainSpec, local: readonly THREE.Vector3[]): boolean {
-  for (let index = 0; index < chain.radii.length; index += 1) {
-    const rest = chain.points[index].distanceTo(chain.points[index + 1])
-    const actual = local[index].distanceTo(local[index + 1])
-    if (!Number.isFinite(actual)) return false
-    // 短骨按"相对比例"和"绝对容差"取更宽的一侧，指尖那一节不会被噪声误判。
-    const min = Math.min(rest * HAND_BONE_MIN_RATIO, Math.max(0, rest - HAND_BONE_SLACK))
-    const max = Math.max(rest * HAND_BONE_MAX_RATIO, rest + HAND_BONE_SLACK * 1.6)
-    if (actual < min || actual > max) return false
+/**
+ * 只用"整根手指跨度"判断这一帧的指关节是否可用。
+ *
+ * 远景全身视频里单节指骨长度会被 2D 估算严重压缩（实测只有默认值的 0.5~0.8 倍，
+ * 帧间还会跳到 0.1 倍），逐节卡容差等于每帧都把手指判成不可信 —— 白膜就会一直
+ * 停在默认手型上，看起来"手指完全不跟动作"。所以这里只拦整体塌陷/炸开的坏帧。
+ */
+function observedSpanOk(chain: FingerChainSpec, local: readonly THREE.Vector3[]): boolean {
+  if (local.length !== chain.points.length) return false
+  const finite = local.every(
+    (point) =>
+      Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z),
+  )
+  if (!finite) return false
+  const restSpan = chain.points[0].distanceTo(chain.points[chain.points.length - 1])
+  const span = local[0].distanceTo(local[local.length - 1])
+  if (restSpan < 1e-6 || !Number.isFinite(span)) return false
+  const ratio = span / restSpan
+  return ratio >= HAND_SPAN_MIN_RATIO && ratio <= HAND_SPAN_MAX_RATIO
+}
+
+/**
+ * 把观测到的关节折线重建成"骨长钉死、方向取自观测"的折线。
+ *
+ * 指关节只有旋转是可以从单目视频里读出来的量，骨长测量在小目标下几乎全是噪声；
+ * 与身体的 IK 拟合同一套思路（固定骨长），这样手指既能跟随握拳/张开，又不会被
+ * 拉长压扁，也不会因为某一节超出容差就整根手指被冻结。
+ */
+function fitChain(chain: FingerChainSpec, local: readonly THREE.Vector3[]): THREE.Vector3[] {
+  const restStart = chain.points[0]
+  // 掌指关节：观测值向默认位置收敛，手指不会从掌面飞出去（Splay 仍保留一半）。
+  const start = restStart.clone().lerp(local[0], HAND_KNUCKLE_WEIGHT)
+  const result: THREE.Vector3[] = [start]
+  for (let index = 1; index < local.length; index += 1) {
+    const restLength = chain.points[index].distanceTo(chain.points[index - 1])
+    const direction = local[index].clone().sub(local[index - 1])
+    if (direction.lengthSq() < 1e-10) {
+      direction.copy(chain.points[index]).sub(chain.points[index - 1])
+    }
+    if (direction.lengthSq() < 1e-10) {
+      direction.copy(chain.initialDirection)
+    }
+    result.push(result[index - 1].clone().addScaledVector(direction.normalize(), restLength))
   }
-  return true
+  return result
 }
 
 function placeBone(
@@ -509,9 +550,13 @@ export function updateHandPart(
       const local = measured.map((point) =>
         toLocal(point, wrist, thumbSide, fingers, palmNormal, scale),
       )
-      if (plausible(chain, local)) {
+      if (observedSpanOk(chain, local)) {
         usable = true
-        shape = shape ? blendChains(shape, local, HAND_SHAPE_SMOOTHING) : local
+        // 观测只提供"朝哪弯"，骨长一律钉回默认值：手指才会跟随动作且不变形。
+        const target = fitChain(chain, local)
+        shape = shape
+          ? fitChain(chain, blendChains(shape, target, HAND_SHAPE_SMOOTHING))
+          : target
         part.lost[chainIndex] = 0
       }
     }
@@ -521,7 +566,10 @@ export function updateHandPart(
       if (!shape) {
         shape = chain.points.map((point) => point.clone())
       } else if (part.lost[chainIndex] > HAND_HOLD_SECONDS) {
-        shape = blendChains(shape, chain.points, 1 - Math.exp(-dt / HAND_RELAX_SECONDS))
+        shape = fitChain(
+          chain,
+          blendChains(shape, chain.points, 1 - Math.exp(-dt / HAND_RELAX_SECONDS)),
+        )
       }
     }
 

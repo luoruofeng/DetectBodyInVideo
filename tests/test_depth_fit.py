@@ -18,7 +18,13 @@ import numpy as np
 import pytest
 import synth_pose
 
-from app.backend.engine.base import PoseFrame
+from app.backend.engine.base import (
+    LEFT_SHOULDER,
+    NOSE,
+    RIGHT_SHOULDER,
+    PoseFrame,
+)
+from app.backend.skeleton.topology import HEAD_FORWARD_METERS
 
 # 模块尚未落地时整个文件自动跳过，落地后自动启用（避免"先写空壳"阻塞其它测试）
 try:
@@ -42,6 +48,18 @@ def _reproj_error(frames: list[PoseFrame], *, aspect: float = synth_pose.ASPECT)
         if value is not None
     ]
     return float(np.mean(values)) if values else 0.0
+
+
+def _head_forward(frames: list[PoseFrame]) -> float:
+    """鼻尖相对胸中点（两肩中点）的中位 z（米）：正 = 头在胸后面，负 = 头往前探。"""
+    values = []
+    for frame in frames:
+        world = frame.world_landmarks
+        chest_z = (
+            world[LEFT_SHOULDER].z + world[RIGHT_SHOULDER].z
+        ) / 2.0
+        values.append(world[NOSE].z - chest_z)
+    return float(np.median(values))
 
 
 def test_synthetic_skeleton_matches_truth():
@@ -104,10 +122,103 @@ def test_fit_is_stable_when_reapplied():
         current = fitted
 
     # 增量必须逐步缩小（不要求"误差单调不增"：压平先验会一直往"更平"的
-    # 不动点走，重投影误差会小幅上升并迅速饱和）
-    assert all(later <= earlier + 1e-3 for earlier, later in zip(drifts, drifts[1:])), drifts
+    # 不动点走，重投影误差会小幅上升并迅速饱和）。容差 3e-3 是因为头部深度目标
+    # （−9 cm）会轻微改变耦合最小二乘的形状，脚趾这种末端关节的收敛因此不再是严格单调。
+    assert all(later <= earlier + 3e-3 for earlier, later in zip(drifts, drifts[1:])), drifts
     assert drifts[-1] < 0.02, drifts
     assert reproj[-1] < 0.02, reproj
+
+
+@requires_fit
+def test_head_bone_length_is_capped_by_anatomy():
+    """头骨段（肩中点→鼻尖）长度必须按「竖直跨度 + 前伸 0.09 m」封顶。
+
+    这是"头前倾"的根因层：MediaPipe 的 world z 把鼻尖放在胸中点前方十几厘米，
+    于是 |chest→nose| 被量成 0.23~0.29 m；一旦当成固定骨长，``|Δz| = sqrt(L² − p²)``
+    就只能把多出来的长度全部变成前探。竖直跨度是 2D 可观测的，前伸量是解剖常数，
+    两者合成才是这个视频里真实的骨长。
+    """
+    frames = synth_pose.make_frames(6)
+    for frame in frames:
+        # 肩中点 y=-0.45：把鼻尖放到 y=-0.60（竖直 15 cm）、z=-0.22（前探 22 cm）——
+        # 3D 距离 0.26 m 落在人体测量学区间内，所以只有"解剖封顶"能拦住它
+        frame.world_landmarks[NOSE].y = -0.60
+        frame.world_landmarks[NOSE].z = -0.22
+    lengths = ik_fit.calibrate_bone_lengths(frames)
+
+    world = frames[0].world_landmarks
+    vertical = abs(world[NOSE].y - (world[LEFT_SHOULDER].y + world[RIGHT_SHOULDER].y) / 2.0)
+    measured = math.dist(
+        (world[NOSE].x, world[NOSE].y, world[NOSE].z),
+        (
+            (world[LEFT_SHOULDER].x + world[RIGHT_SHOULDER].x) / 2.0,
+            (world[LEFT_SHOULDER].y + world[RIGHT_SHOULDER].y) / 2.0,
+            (world[LEFT_SHOULDER].z + world[RIGHT_SHOULDER].z) / 2.0,
+        ),
+    )
+    assert measured > math.hypot(vertical, HEAD_FORWARD_METERS) + 0.05, "测试前提：测量值被深度撑大"
+    assert lengths.lengths["head"] == pytest.approx(
+        math.hypot(vertical, HEAD_FORWARD_METERS), abs=2e-3
+    )
+    assert any("封顶" in note for note in lengths.notes)
+
+
+@requires_fit
+def test_head_depth_prior_lands_on_anatomical_offset():
+    """直立站姿 + MediaPipe 式前探偏置：鼻尖必须回到「胸中点前方约 9 cm」的解剖位置。
+
+    造数据的方式对齐真实失效路径：2D 是**真值**投影（正面机位看不见深度），world z
+    把鼻尖估到胸中点前方 20 cm。于是 ``|Δz| = sqrt(L² − p²)`` 里 L 被这个偏置撑大、
+    p 由 2D 定死 —— 差额全部变成"头往前探"。
+
+    注意目标不是把 Δz 压到 **0**：解剖上颅骨中心（两耳中点）才正落在肩中点铅垂线上，
+    鼻尖在它前方 9~10 cm。压到 0 会让头中心跑到胸后方同样距离（表现为仰头/脖子后缩）。
+    所以这里断言"鼻尖落在 0~12 cm 的前方"，并进一步要求头中心回到胸平面附近。
+
+    ``depth_prior_weight=4.0`` 用来复现"压不回去"的场景：压平权重正比于弱透视尺度 k
+    （人物离得远就小），而朝 d0 回归的权重是常数，两者之比可以用这个参数等效调整。
+    """
+    from app.backend.skeleton.mapping import head_reference_point
+
+    clean = synth_pose.make_frames(8)
+    biased = [frame.model_copy(deep=True) for frame in clean]
+    for frame in biased:
+        frame.world_landmarks[NOSE].z = -0.20  # 胸中点在 z=0
+    config = ik_fit.FitConfig(depth_prior_weight=4.0)
+    off = config.model_copy(update={"head_depth": ik_fit.HeadDepthConfig(enabled=False)})
+    baseline, _ = ik_fit.fit_frames(biased, off)
+    tuned, report = ik_fit.fit_frames(biased, config)
+
+    forward_after = abs(_head_forward(tuned))
+    assert abs(_head_forward(biased)) > 0.15, "测试前提：输入里鼻尖确实被估到了胸前方"
+    # 鼻尖（头骨段末端）落回解剖位置：胸中点前方 0~12 cm
+    assert 0.0 <= forward_after <= 0.12, forward_after
+    # 头中心（鼻尖后移 9 cm）落在胸平面附近，而不是稳定前探/后缩
+    head_offsets = []
+    for frame in tuned:
+        head = head_reference_point(frame, use_world=True)
+        assert head is not None
+        chest_z = (
+            frame.world_landmarks[LEFT_SHOULDER].z + frame.world_landmarks[RIGHT_SHOULDER].z
+        ) / 2.0
+        head_offsets.append(abs(head.z - chest_z))
+    assert max(head_offsets) < 0.05, head_offsets
+    # 关掉头部专项先验只是不改"目标值"，骨长封顶仍然生效（这是骨长估计，不是深度先验），
+    # 所以这里顺带确认：两种配置下的头中心都不该稳定前探。
+    baseline_offsets = []
+    for frame in baseline:
+        head = head_reference_point(frame, use_world=True)
+        assert head is not None
+        chest_z = (
+            frame.world_landmarks[LEFT_SHOULDER].z + frame.world_landmarks[RIGHT_SHOULDER].z
+        ) / 2.0
+        baseline_offsets.append(abs(head.z - chest_z))
+    assert max(baseline_offsets) < 0.05, baseline_offsets
+    # 压平是"用一点点画面内误差换掉不可观测的深度"，不能把帧判成不达标而回退
+    assert report.frames_fitted == report.frames
+    assert report.reproj_error_norm < 0.02
+    # 骨长仍然是硬约束（压平不允许把骨段拉长/压短）
+    assert report.bone_length_error_pct < 1.0
 
 
 @requires_fit

@@ -11,7 +11,12 @@ from app.backend.engine.base import (
     Landmark,
     PoseFrame,
 )
-from app.backend.postprocess.angles import angle_deg, compute_angles, torso_lean
+from app.backend.postprocess.angles import (
+    angle_deg,
+    compute_angles,
+    head_lean,
+    torso_lean,
+)
 from app.backend.postprocess.gaps import GapFillConfig, densify, process_gaps
 from app.backend.postprocess.one_euro import OneEuroFilter1D, OneEuroParams, smooth_array
 from app.backend.postprocess.pipeline import PostProcessConfig, run_postprocess
@@ -205,6 +210,37 @@ def test_torso_lean_upright_vs_horizontal() -> None:
 
     horizontal = Landmark(x=0.8, y=0.7, z=0.0, visibility=0.9)
     assert torso_lean(horizontal, hips) == pytest.approx(90.0, abs=1e-6)
+
+
+def test_head_lean_is_sagittal_only() -> None:
+    """头前倾只看沿视线的偏移；横向歪头不该被读成前倾。"""
+    shoulders = Landmark(x=0.5, y=0.4, z=0.0, visibility=0.9)
+    upright = Landmark(x=0.5, y=0.1, z=0.0, visibility=0.9)
+    sideways = Landmark(x=0.66, y=0.1, z=0.0, visibility=0.9)
+    forward = Landmark(x=0.5, y=0.1, z=-0.15, visibility=0.9)
+
+    assert head_lean(shoulders, upright) == pytest.approx(0.0, abs=1e-6)
+    assert head_lean(shoulders, sideways) == pytest.approx(0.0, abs=1e-6)
+    # atan2(0.15, 0.30) = 26.565°
+    assert head_lean(shoulders, forward) == pytest.approx(26.5651, abs=1e-3)
+    # 后仰同样按"偏离竖直"计量（量级，不带符号）
+    backward = Landmark(x=0.5, y=0.1, z=0.15, visibility=0.9)
+    assert head_lean(shoulders, backward) == pytest.approx(26.5651, abs=1e-3)
+
+
+def test_compute_angles_emits_head_lean() -> None:
+    frame = make_frame(
+        0,
+        points={
+            0: (0.50, 0.10, 0.02),  # nose
+            7: (0.47, 0.12, 0.00),  # left ear
+            8: (0.53, 0.12, 0.00),  # right ear
+            11: (0.42, 0.35, 0.00),  # left shoulder
+            12: (0.58, 0.35, 0.00),  # right shoulder
+        },
+    )
+    angles = compute_angles(frame)
+    assert isinstance(angles["head_lean"], float)
 
 
 # --------------------------------------------------------------------------- #

@@ -91,7 +91,11 @@ def _animated_layout(phase: float) -> dict[int, tuple[float, float, float]]:
     layout[26] = (layout[26][0] + step * 1.6, layout[26][1], layout[26][2])
     layout[27] = (layout[27][0] - step * 2.2, layout[27][1], layout[27][2])
     layout[28] = (layout[28][0] + step * 2.2, layout[28][1], layout[28][2])
-    return layout
+    # 镜像成"面向镜头"的手性：MediaPipe 约定面向镜头时人物左侧落在图像右侧（x > 0.5）。
+    # ``_BASE_LAYOUT`` 原本写反了（左肩在 x<0.5），与本文件"人物面向镜头、鼻尖 z 为负"
+    # 的其它约定矛盾 —— 那会让 ``mapping._body_forward`` 判出"背对镜头"，把鼻尖前伸量
+    # 加到反方向，进而让 head_joint 凭空前探。
+    return {index: (1.0 - x, y, z) for index, (x, y, z) in layout.items()}
 
 
 def synthetic_pose_frames(

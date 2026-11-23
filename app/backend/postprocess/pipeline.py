@@ -2,7 +2,7 @@
 
 顺序（改动后）：
 选目标 track → 补连续帧 → 标记无效帧 → 补短缺口 → 平滑 → **手部时序稳定** →
-骨长标定 → yaw 估计 → **深度符号先验** → 固定骨长 IK 拟合 → 算角度 → 质检。
+骨长标定 → yaw 估计 → **直立基准校准** → **深度符号先验** → 固定骨长 IK 拟合 → 算角度 → 质检。
 
 三个关键约定：
 - 平滑只作用在有效帧上，避免空占位帧的 0 值把轨迹拉回原点；
@@ -42,6 +42,7 @@ from app.backend.postprocess.hands import (
 from app.backend.postprocess.ik_fit import (
     FitConfig,
     FitReport,
+    HeadDepthConfig,
     calibrate_bone_lengths,
     fit_frames,
 )
@@ -58,6 +59,11 @@ from app.backend.postprocess.swing import (
     SwingLegReport,
     detect_kick_phases,
     identify_swing_leg,
+)
+from app.backend.postprocess.upright import (
+    UprightBaselineConfig,
+    UprightBaselineReport,
+    calibrate_upright_baseline,
 )
 from app.backend.skeleton.orientation import (
     YawConfig,
@@ -92,6 +98,11 @@ class PostProcessConfig(BaseModel):
         description="摆动腿识别与踢腿相位（只读 2D 轨迹）：给方向先验分配权重，不改变坐标",
     )
     yaw: YawConfig = Field(default_factory=YawConfig)
+    upright_baseline: UprightBaselineConfig = Field(
+        default_factory=UprightBaselineConfig,
+        description="正对静止片段的 z 偏置校准：躯干（chest−pelvis，加性常数）与头部"
+        "（ear_mid−chest，作用于两耳）两个独立偏置；默认开启，门控不满足时自动跳过",
+    )
     estimate_orientation: bool = Field(
         True, description="用肩宽/髋宽比估计身体 yaw（作为拟合先验，也进 PostProcessResult）"
     )
@@ -118,6 +129,7 @@ def legacy_postprocess_config() -> PostProcessConfig:
     - ``hand_stability.enabled=False``：手部 21 点原样透传，不做补帧/迟滞/平滑；
     - ``ik_fit.hold_occluded_limbs=False`` / ``angles.hold_occluded_frames=0``：
       关闭遮挡肢体的相对角度保持和角度读数保持；
+    - ``ik_fit.head_depth.enabled=False``：头骨段不再单列压平/放开回归；
     - ``quality.enable_depth_gate=False`` / ``enable_framing_rules=False``：质检不因新指标降级。
 
     新增的字段（depthConfidence 等）仍会输出，但都是附加信息，不改变可用数值。
@@ -138,9 +150,11 @@ def legacy_postprocess_config() -> PostProcessConfig:
             symmetrize_bones=False,
             hold_occluded_limbs=False,
             depth_sign_weight=0.0,
+            head_depth=HeadDepthConfig(enabled=False),
         ),
         depth_sign=DepthSignConfig(enabled=False),
         swing=SwingConfig(enabled=False),
+        upright_baseline=UprightBaselineConfig(enabled=False),
         estimate_orientation=False,
         quality=QualityConfig(enable_depth_gate=False, enable_framing_rules=False),
     )
@@ -158,6 +172,7 @@ class PostProcessResult(BaseModel):
     swing: SwingLegReport = Field(default_factory=SwingLegReport)
     kick_phases: KickPhaseReport = Field(default_factory=KickPhaseReport)
     yaw: list[YawEstimate] = Field(default_factory=list)
+    upright_baseline: UprightBaselineReport = Field(default_factory=UprightBaselineReport)
     tracks: list[TrackSummary] = Field(default_factory=list)
     primary_track_id: int | None = None
     target_track_id: int | None = None
@@ -243,6 +258,11 @@ def run_postprocess(
         emit("yaw", "估计身体朝向", 0, max(1, len(final)))
         yaw_estimates = estimate_yaws(final, lengths, config.yaw, aspect=aspect)
         emit("yaw", "估计身体朝向", len(final), max(1, len(final)))
+
+    # 2.4) 直立基准校准：正对静止时才动上半身 world z，且必须在 IK 之前。
+    emit("upright", "校正直立基准", 0, max(1, len(final)))
+    upright_report = calibrate_upright_baseline(final, yaw_estimates, config.upright_baseline)
+    emit("upright", "校正直立基准", len(final), max(1, len(final)))
 
     # 2.5) 摆动腿 / 踢腿相位：只用 2D 轨迹，不引入新的深度假设。
     #    用途是给方向先验分配权重：摆动腿更强、支撑腿更保守；最大伸展附近放宽、静止段收紧。
@@ -335,6 +355,7 @@ def run_postprocess(
         swing=swing_report,
         kick_phases=phases_report,
         yaw=yaw_estimates,
+        upright_baseline=upright_report,
         tracks=result.tracks,
         primary_track_id=result.primary_track_id,
         target_track_id=result.target_track_id,

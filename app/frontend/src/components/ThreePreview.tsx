@@ -67,6 +67,11 @@ function groundedHipHeight(frame: PreviewFrame | null): number {
   return span
 }
 
+/** 后端水平锚定偏移；缺失/NaN 时退回 0（推理中还没有后处理结果）。 */
+function finiteOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
 /** three.js 骨骼预览：按米制关节渲染球棍骨架，跟随播放头逐帧更新。 */
 export function ThreePreview({ frame, showGrid, theme }: ThreePreviewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -194,7 +199,11 @@ export function ThreePreview({ frame, showGrid, theme }: ThreePreviewProps) {
     if (!refs) return
 
     // 每帧按着地脚重新定位髋高度：深蹲时髋下沉，脚不再悬空。
+    // x/z 用后端锚定后的偏移：关节是髋局部坐标，不加这一步，原地站立时
+    // 双脚会跟着髋的晃动在地面上滑动（"没站实"）。
     refs.group.position.y = groundedHipHeight(frame)
+    refs.group.position.x = finiteOrZero(frame?.hipOffsetX)
+    refs.group.position.z = finiteOrZero(frame?.hipOffsetZ)
 
     const position = refs.bones.geometry.getAttribute('position') as THREE.BufferAttribute
     const array = position.array as Float32Array

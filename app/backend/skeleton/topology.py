@@ -37,6 +37,7 @@ from app.backend.engine.base import (
 
 PELVIS = "pelvis"
 CHEST = "chest"
+HEAD = "head"
 
 # 参与拟合/标定的实节点（写回 world_landmarks 的索引）
 CORE_INDICES: tuple[int, ...] = (
@@ -60,6 +61,14 @@ CORE_INDICES: tuple[int, ...] = (
 # 不需要依赖世界坐标就能测宽度的点对（用于 yaw 的宽度比）
 SHOULDER_PAIR: tuple[int, int] = (LEFT_SHOULDER, RIGHT_SHOULDER)
 HIP_PAIR: tuple[int, int] = (LEFT_HIP, RIGHT_HIP)
+
+# 鼻尖相对「颅骨中心（两耳中点）/肩中点铅垂线」的解剖前伸量（米）。
+# 解剖站立姿势的铅垂线穿过耳垂、肩峰与股骨大转子：颅骨中心几乎正落在肩中点上方，
+# 鼻尖在它前方 9~10 cm。这个常数有三处用途，必须是同一个值，否则三处会互相打架：
+# - ``ik_fit`` 头骨段（肩中点→鼻尖）的深度目标与骨长上限；
+# - ``mapping`` 里 head_joint 相对鼻尖的后移量（``NOSE_PROTRUSION_METERS``）；
+# - 输出侧「颅骨中心前探上限」的标尺。
+HEAD_FORWARD_METERS = 0.09
 
 
 @dataclass(frozen=True)
@@ -85,7 +94,13 @@ NODES: tuple[NodeSpec, ...] = (
     NodeSpec("left_hip", PELVIS, LEFT_HIP, "left_upLeg_joint", 0.08, 0.18),
     NodeSpec("right_hip", PELVIS, RIGHT_HIP, "right_upLeg_joint", 0.08, 0.18),
     NodeSpec(CHEST, PELVIS, None, "spine_7_joint", 0.35, 0.60),
-    NodeSpec("head", CHEST, NOSE, "head_joint", 0.22, 0.45),
+    # 肩中点 → 鼻尖。解剖上 = hypot(竖直 0.13~0.18, 前伸 ``HEAD_FORWARD_METERS``)
+    # ≈ 0.17~0.21 m。旧区间 (0.24, 0.34) 是按 MediaPipe 的 world z 量出来的，而那一截
+    # 深度本身就是"脸朝镜头"的先验量（实测 0.20~0.27）：当成骨长固定下来之后，
+    # "固定骨长 + 2D 重投影" 会把多出来的 5~8 cm 全部塞进 Δz，于是直立站立时
+    # 头部稳定前探 15~20 cm —— 这就是"正对镜头站立却明显头前倾"的直接来源。
+    # 区间收到解剖范围，越界时回落到 0.21（``ik_fit`` 另有更严的解剖上限）。
+    NodeSpec(HEAD, CHEST, NOSE, "head_joint", 0.14, 0.28),
     # ---- 左臂 ----
     NodeSpec("left_shoulder", CHEST, LEFT_SHOULDER, "left_shoulder_1_joint", 0.10, 0.28),
     NodeSpec("left_elbow", "left_shoulder", LEFT_ELBOW, "left_arm_joint", 0.24, 0.36),
@@ -134,6 +149,8 @@ __all__ = [
     "BONE_SEGMENTS",
     "CHEST",
     "CORE_INDICES",
+    "HEAD",
+    "HEAD_FORWARD_METERS",
     "HIP_PAIR",
     "JITTER_GROUPS",
     "JOINT_TO_NODE",

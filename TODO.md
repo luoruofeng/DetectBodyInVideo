@@ -321,7 +321,7 @@ DetectBodyInVideo/
 | 25/26 knee | `left_leg_joint` / `right_leg_joint` |
 | 27/28 ankle | `left_foot_joint` / `right_foot_joint` |
 | 31/32 foot_index | `left_toes_joint` / `right_toes_joint` |
-| 0 nose | `head_joint`（头部朝向需结合耳/眼推算） |
+| 7/8 耳中点 → `head_joint` | `head_joint`（耳中点即颅骨中心；耳不可见时退化为「鼻尖沿人体朝向收回 9 cm」，不直接取鼻尖，否则头会永久前探） |
 | 11-12 中点 | `spine_3_joint` |
 | 23-24 中点 → 颈 | `spine_7_joint` |
 

@@ -6,11 +6,19 @@ import math
 
 import pytest
 
-from app.backend.engine.base import LANDMARK_COUNT, Landmark, PoseFrame
+from app.backend.engine.base import (
+    LANDMARK_COUNT,
+    LEFT_EAR,
+    NOSE,
+    RIGHT_EAR,
+    Landmark,
+    PoseFrame,
+)
 from app.backend.skeleton.bundle import SkeletonConfig, build_skeleton_bundle
 from app.backend.skeleton.live import LiveSkeletonMapper
 from app.backend.skeleton.mapping import (
     ARKIT_JOINTS,
+    NOSE_PROTRUSION_METERS,
     map_frame,
     validate_mapping,
 )
@@ -151,6 +159,94 @@ def test_mirrored_input_swaps_sides() -> None:
     assert mirrored.joints["right_arm_joint"].x == pytest.approx(
         original.joints["left_arm_joint"].x, abs=0.02
     )
+
+
+# --------------------------------------------------------------------------- #
+# 头部深度（"直立站着头往前探"的回归）
+# --------------------------------------------------------------------------- #
+def forward_nose_frame(
+    nose_z: float = -0.20, *, ear_visibility: float = 0.0
+) -> PoseFrame:
+    """世界坐标里把鼻尖整体推近镜头，可选把两耳藏起来（正面全身的常见情况）。
+
+    注意 ``make_pose_frame`` 的世界 x 是 ``(x-0.5)*0.5``，左肩落在 -x —— 那是"背对镜头"
+    的朝向。MediaPipe 的真实约定是"面向镜头时人物左侧在 +x"，所以这里把 x 整体取反，
+    让 ``_body_forward`` 得到 -z（朝镜头），与生产数据一致。
+    """
+    frame = make_pose_frame(world=True)
+    for point in frame.world_landmarks:
+        point.x = -point.x
+    frame.world_landmarks[NOSE].z = nose_z
+    for index in (LEFT_EAR, RIGHT_EAR):
+        frame.world_landmarks[index].visibility = ear_visibility
+    return frame
+
+
+def test_head_joint_falls_back_to_nose_minus_anatomical_protrusion() -> None:
+    """耳不可见时不能直接拿鼻尖当 head_joint：鼻尖天然在颅骨前面 9 cm。"""
+    nose_z = -0.20
+    skeleton = map_frame(forward_nose_frame(nose_z), use_world=True)
+
+    # 人物面向镜头 → 朝向 -z，所以"收回颅骨中心"是往 +z 移
+    assert skeleton.joints["head_joint"].z > nose_z + 0.05
+    # 这个样例的鼻尖比胸中点前探 20 cm（远超真人），因此会触发前探软上限：
+    # 颅骨中心最多比胸中点前探 limit + soft ≈ 6.7 cm
+    assert skeleton.joints["head_joint"].z < -0.04
+    assert skeleton.joints["head_joint"].z == pytest.approx(
+        -0.20 + NOSE_PROTRUSION_METERS, abs=0.05
+    )
+
+
+def test_head_joint_uses_ear_midpoint_in_plane_but_never_its_depth() -> None:
+    """两耳可见时只用它的左右/上下：深度一律由被约束过的鼻尖反推。
+
+    两耳不参与骨长/重投影拟合，正面机位下它们的 z 是 MediaPipe 的自由先验量
+    （实测相对肩中点稳定前探 1.5~10 cm）。直接拿来当 head_joint 的深度，就是
+    "正对镜头站立却明显头前倾"的来源，所以这里必须与耳的 z 无关。
+    """
+    frame = forward_nose_frame(-0.20, ear_visibility=0.95)
+    skeleton = map_frame(frame, use_world=True)
+    ears = frame.world_landmarks
+    ear_mid_x = (ears[LEFT_EAR].x + ears[RIGHT_EAR].x) / 2.0
+    ear_mid_y = (ears[LEFT_EAR].y + ears[RIGHT_EAR].y) / 2.0
+    # 画面内位置仍取耳中点（可观测）
+    assert skeleton.joints["head_joint"].x == pytest.approx(ear_mid_x, abs=1e-6)
+    assert skeleton.joints["head_joint"].y == pytest.approx(ear_mid_y, abs=1e-6)
+    # 深度取鼻尖 - 前伸量（面向镜头 → 往 +z 收回 9 cm），与耳的 z 无关；
+    # 该样例鼻尖前探 20 cm 属异常输入，会被前探软上限压到胸中点前方 ≤ 6.7 cm
+    assert skeleton.joints["head_joint"].z == pytest.approx(
+        -0.20 + NOSE_PROTRUSION_METERS, abs=0.05
+    )
+
+    # 把两耳的 z 改到很前面（模拟 MediaPipe 的头前探先验），head_joint 的深度不能跟着动
+    for index in (LEFT_EAR, RIGHT_EAR):
+        frame.world_landmarks[index].z = -0.60
+    again = map_frame(frame, use_world=True)
+    assert again.joints["head_joint"].z == pytest.approx(
+        skeleton.joints["head_joint"].z, abs=1e-6
+    )
+
+
+def test_spine_chain_does_not_inherit_head_depth() -> None:
+    """头偏置不能经 neck→spine 的插值放大成整条脊柱前倾。"""
+    skeleton = map_frame(forward_nose_frame(-0.20), use_world=True)
+
+    # 髋/肩的 z 都是 0（竖直躯干），所以躯干深度轴必须是 0
+    assert skeleton.joints["neck_1_joint"].z == pytest.approx(0.0, abs=1e-6)
+    assert skeleton.joints["spine_7_joint"].z == pytest.approx(0.0, abs=1e-6)
+    assert skeleton.joints["spine_3_joint"].z == pytest.approx(0.0, abs=1e-6)
+    # 而头本身仍然保留了（补偿后的）深度，不是被一起抹平
+    assert skeleton.joints["head_joint"].z < -0.05
+
+
+def test_spine_chain_keeps_real_torso_pitch() -> None:
+    """躯干真的前倾时（肩比髋更靠镜头），脊柱必须跟着倾斜 —— 只挡头的偏置。"""
+    frame = make_pose_frame(world=True)
+    frame.world_landmarks[11].z = -0.10
+    frame.world_landmarks[12].z = -0.10
+    skeleton = map_frame(frame, use_world=True)
+    assert skeleton.joints["spine_7_joint"].z < -0.05
+    assert skeleton.joints["neck_1_joint"].z < -0.05
 
 
 # --------------------------------------------------------------------------- #

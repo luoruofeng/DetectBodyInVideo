@@ -13,7 +13,8 @@
 
 缺失关节的推导：
 - ``hips_joint`` / ``root``：两髋中点；``spine_*``：髋中点 → 颈根线性插值；
-- ``neck_*``：肩中点 → 头中心线性插值；``head_joint``：两耳中点（缺耳用鼻尖）；
+- ``neck_*``：肩中点 → 头中心线性插值；``head_joint``：左右/上下取两耳中点（缺耳用
+  鼻尖），**深度由鼻尖反推**（两耳的 z 是不受约束的先验量，见 ``_head_reference``）；
 - ``*_toesEnd_joint``：踝 → 脚尖方向按 0.22 外推；
 - 指端 ``*End_joint``：用指尖 - 上一指节方向按 0.35 外推。
 
@@ -57,6 +58,7 @@ from app.backend.engine.base import (
     PoseFrame,
 )
 from app.backend.engine.enhancements import FACE_SUBSET_NAMES, HAND_LANDMARK_COUNT
+from app.backend.skeleton.topology import HEAD_FORWARD_METERS
 
 logger = get_logger("skeleton.mapping")
 
@@ -234,6 +236,23 @@ NECK_RATIO = 0.35
 TOES_END_RATIO = 0.22
 DERIVED_VISIBILITY_FACTOR = 0.9
 
+# 鼻尖到颅骨中心的前伸量（米）。MediaPipe 的 nose 是**鼻尖表面点**，解剖上位于头中心
+# 前方 9~10 cm；直接拿它当 ``head_joint`` 会让 3D 预览里的头永久往前探。唯一真源在
+# ``topology.HEAD_FORWARD_METERS``（ik_fit 的头部深度目标用的也是它）。
+NOSE_PROTRUSION_METERS = HEAD_FORWARD_METERS
+# 两耳可见度都高于该值才认为"耳中点可以代表颅骨中心"。
+EAR_VISIBILITY_THRESHOLD = 0.3
+# 颅骨中心相对肩中点的**前后软边界**，用解剖前伸量的比例表示（0.5 ≈ 4.5 cm）：
+# 正常直立与轻中度前倾都在这条线以内；超过它的部分按 ``SOFT`` 渐近饱和（不硬截断，
+# 避免逐帧跨阈值时头突然跳一下）。原始推理帧（未做骨长拟合）里 MediaPipe 会把头
+# 放在前方 10 cm 以上，这一步保证边算边看的预览也不会"张着嘴往前倒"。
+HEAD_FORWARD_LIMIT_RATIO = 0.5
+HEAD_FORWARD_SOFT_RATIO = 0.25
+# 后仰方向没有观测支持（鼻尖相对胸中点没有靠后的解剖可能），只留一点点余量并同样
+# 渐近饱和：否则"鼻尖被压平到胸中点正上方"的帧会被反推成"颅骨中心退到胸后方 9 cm"，
+# 在正面机位下看起来就是脖子后缩、仰头。
+HEAD_BACKWARD_SOFT_RATIO = 0.08
+
 
 class JointPoint(BaseModel):
     x: float = 0.0
@@ -302,6 +321,117 @@ def _extrapolate(a: Landmark, b: Landmark, ratio: float) -> JointPoint:
         visibility=min(a.visibility, b.visibility) * DERIVED_VISIBILITY_FACTOR,
         source="derived",
     )
+
+
+def _body_forward(points: Sequence[Landmark]) -> tuple[float, float]:
+    """人体朝向在水平面内的单位向量 ``(x, z)``，只用于"把鼻尖收回颅骨中心"。
+
+    肩线 ``right→left`` 绕竖直轴转 +90° 就是胸廓法向：人物面向镜头时得到 ``-z``，
+    背对镜头时 ``+z``，正侧面时 ``±x`` —— 三种情况都正确，不需要额外状态。
+    肩线退化（几乎一点）时退回 ``-z``（MediaPipe 约定的"朝向镜头"）。
+    """
+    dx = points[LEFT_SHOULDER].x - points[RIGHT_SHOULDER].x
+    dz = points[LEFT_SHOULDER].z - points[RIGHT_SHOULDER].z
+    norm = math.hypot(dx, dz)
+    if norm < 1e-6:
+        return 0.0, -1.0
+    return dz / norm, -dx / norm
+
+
+def _protrusion(frame: PoseFrame, points: Sequence[Landmark], use_world: bool) -> float:
+    """``NOSE_PROTRUSION_METERS`` 换算到当前坐标空间；换不出来就不补（返回 0）。
+
+    归一化坐标空间里 z 是无量纲的，直接减 0.09 会变成一个巨大的偏移 —— 所以必须先用
+    ``_local_world_scale`` 把"米/归一化单位"求出来。求不出来说明这帧本来就没有米制
+    世界坐标，那时"鼻尖前伸多少"完全无从谈起，按"没有证据就不动"的原则返回 0。
+    """
+    if use_world:
+        return NOSE_PROTRUSION_METERS
+    scale = _local_world_scale(frame)
+    if scale is None or scale <= 1e-6:
+        return 0.0
+    return NOSE_PROTRUSION_METERS / scale
+
+
+def _head_reference(points: Sequence[Landmark], protrusion: float) -> JointPoint:
+    """头中心（颅骨中心）估计 = 鼻尖沿人体朝向反推 ``protrusion``。
+
+    **每一路坐标都取自己最有把握的来源**：
+
+    - 左右 / 上下：两耳都可见（``>= EAR_VISIBILITY_THRESHOLD``）就用耳中点（画面内
+      可观测，且正是颅骨中心的高度）；耳被头发挡住时退回鼻尖；
+    - 深度：**一律不用两耳的 z**，改由鼻尖反推。鼻尖是头骨段（肩中点→鼻尖）的末端点，
+      被「固定骨长 + 2D 重投影 + 头部深度先验」约束过；两耳**不参与**任何拟合，
+      正面机位下它们的 z 是 MediaPipe 的自由先验量（实测相对肩中点稳定前探 1.5~10 cm），
+      直接当 head_joint 的深度就是"直立站着头往前探"的来源。
+
+    解剖关系是固定量而非按帧猜：颅骨中心几乎正落在肩中点铅垂线上，鼻尖在它前方
+    ``protrusion``（9~10 cm），所以 ``head = nose − protrusion · 人体朝向``。
+    人物侧对镜头时朝向的水平分量在 x 上，这条式子同样成立。
+
+    最后再用 ``HEAD_FORWARD_LIMIT_RATIO`` / ``HEAD_BACKWARD_SOFT_RATIO`` 给"颅骨中心
+    相对肩中点"的前后位置加软边界：拟合后的结果本来就在边界以内，这一层只兜住
+    **原始推理帧**（骨长还没拟合）和个别异常帧 —— 既避免预览里出现十几厘米的前探，
+    也避免"鼻尖被压平到胸中点正上方"时被反推成脖子后缩。
+    """
+    nose = points[NOSE]
+    forward_x, forward_z = _body_forward(points)
+    if min(points[LEFT_EAR].visibility, points[RIGHT_EAR].visibility) >= EAR_VISIBILITY_THRESHOLD:
+        ears = _midpoint(points[LEFT_EAR], points[RIGHT_EAR], source="estimated")
+        x, y, visibility = ears.x, ears.y, ears.visibility
+    else:
+        x = nose.x - forward_x * protrusion
+        y = nose.y
+        visibility = nose.visibility
+    # 世界坐标 -z = 靠近镜头：头中心 = 鼻尖 - 前伸量 · 朝向
+    z = nose.z - forward_z * protrusion
+
+    chest = _midpoint(points[LEFT_SHOULDER], points[RIGHT_SHOULDER])
+    if protrusion > 1e-9:
+        forward = chest.z - z  # 正 = 头比肩更靠镜头
+        limit = HEAD_FORWARD_LIMIT_RATIO * protrusion
+        soft = HEAD_FORWARD_SOFT_RATIO * protrusion
+        if forward > limit and soft > 1e-9:
+            forward = limit + soft * (1.0 - math.exp(-(forward - limit) / soft))
+        elif forward < 0.0:
+            # 后仰：没有观测支持，只留很小一点余量
+            back_soft = HEAD_BACKWARD_SOFT_RATIO * protrusion
+            forward = -back_soft * (1.0 - math.exp(forward / back_soft))
+        z = chest.z - forward
+    return JointPoint(x=x, y=y, z=z, visibility=visibility, source="estimated")
+
+
+def head_reference_point(
+    frame: PoseFrame, *, use_world: bool = True
+) -> JointPoint | None:
+    """公开入口：取该帧的颅骨中心（``head_joint`` 的来源），供角度计算复用。
+
+    与 ``map_frame`` 走同一个函数，避免"角度按一套定义、坐标按另一套定义"。
+    """
+    points = (
+        frame.world_landmarks
+        if use_world and len(frame.world_landmarks) >= LANDMARK_COUNT
+        else frame.landmarks
+    )
+    if len(points) < LANDMARK_COUNT:
+        return None
+    return _head_reference(points, _protrusion(frame, points, use_world))
+
+
+def _torso_axis_z(y: float, hips: JointPoint, shoulders: JointPoint) -> float:
+    """躯干深度轴：只在髋→肩的 z 之间插值，**不继承头部的 z**。
+
+    为什么不能让脊柱继承头：正面机位下 head 的 z 纯属先验量（面朝镜头那一侧永远被估得
+    更近），而 ``neck = lerp(shoulder_mid, head, 0.35)``、``spine_7 = lerp(hips, neck, 0.75)``
+    会把这个偏置按 0.26 的比例放大成整条脊柱的前倾 —— 看起来就是"整个人往前倒"。
+    躯干本身的俯仰由髋→肩的 z 表达（那一对点是拟合/直立基准真正约束过的），足够。
+    """
+    span = shoulders.y - hips.y
+    if abs(span) < 1e-6:
+        return (hips.z + shoulders.z) / 2.0
+    # 允许略微外推到肩线以上（neck 在肩上方），但不跟随头走太远
+    ratio = max(-0.2, min(1.6, (y - hips.y) / span))
+    return hips.z + ratio * (shoulders.z - hips.z)
 
 
 def _local_world_scale(frame: PoseFrame) -> float | None:
@@ -454,13 +584,11 @@ def map_frame(
     hips_mid = _midpoint(points[LEFT_HIP], points[RIGHT_HIP])
     shoulders_mid = _midpoint(points[LEFT_SHOULDER], points[RIGHT_SHOULDER])
 
-    ears_visible = min(points[LEFT_EAR].visibility, points[RIGHT_EAR].visibility) >= 0.3
-    head_reference = (
-        _midpoint(points[LEFT_EAR], points[RIGHT_EAR], source="derived")
-        if ears_visible
-        else _to_point(points[NOSE])
-    )
+    head_reference = _head_reference(points, _protrusion(frame, points, use_world))
     neck = _lerp(shoulders_mid, head_reference, NECK_RATIO)
+    # x/y 朝头插值（左右/上下位置需要），z 换成躯干深度轴：不继承头部的 z，
+    # 否则几厘米的头偏置会被 0.35 带进 neck、再被 0.75 带进 spine_7，表现为"上身整体前倾"。
+    neck = neck.model_copy(update={"z": _torso_axis_z(neck.y, hips_mid, shoulders_mid)})
     neck_landmark = _joint_to_landmark(neck)
     hips_landmark = _joint_to_landmark(hips_mid)
     shoulders_landmark = _joint_to_landmark(shoulders_mid)
@@ -470,13 +598,7 @@ def map_frame(
     joints["spine_3_joint"] = _lerp(hips_landmark, neck_landmark, SPINE_3_RATIO)
     joints["spine_7_joint"] = _lerp(hips_landmark, neck_landmark, SPINE_7_RATIO)
     joints["neck_1_joint"] = neck
-    joints["head_joint"] = JointPoint(
-        x=head_reference.x,
-        y=head_reference.y,
-        z=head_reference.z,
-        visibility=head_reference.visibility,
-        source="estimated",
-    )
+    joints["head_joint"] = head_reference.model_copy(update={"source": "estimated"})
 
     if include_optional or include_all:
         joints["left_forearm_joint"] = _lerp(points[LEFT_ELBOW], points[LEFT_WRIST], 0.5)
@@ -591,6 +713,7 @@ __all__ = [
     "RIGHT_JOINTS",
     "JointPoint",
     "SkeletonFrame",
+    "head_reference_point",
     "joint_names",
     "map_frame",
     "map_frames",

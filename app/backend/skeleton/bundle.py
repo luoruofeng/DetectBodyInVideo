@@ -61,6 +61,11 @@ class SkeletonConfig(BaseModel):
         description="按脚踝/脚尖着地锚定地面：恢复 world 模式下被髋原点抹掉的下蹲下沉，"
         "并把支撑脚钉在平滑后的地面高度上（原地动作时脚不会随关键点噪声上下跳）",
     )
+    anchor_feet_horizontal: bool = Field(
+        True,
+        description="水平脚底锚定：把双脚水平基准点反解成 root.x/z，脚固定在原地、髋绕脚晃。"
+        "关掉后原地站立时脚会跟着髋的局部坐标在地面上漂",
+    )
 
 
 class SkeletonBundle(BaseModel):
@@ -126,7 +131,7 @@ def build_skeleton_bundle(
     world = map_frames(ordered, use_world=True, **map_kwargs)
     converted = convert_frames(world)
     ground_references: list[GroundReference] = []
-    ground_config = GroundContactConfig()
+    ground_config = GroundContactConfig(anchor_horizontal=config.anchor_feet_horizontal)
     if config.anchor_feet_to_ground:
         converted, ground_references = anchor_feet_to_ground(converted, ground_config)
     root_motion = build_root_motion(
@@ -160,10 +165,29 @@ def build_skeleton_bundle(
                 "支撑脚已按平滑后的跨度锁定（两骨 IK 重排膝，骨长不变）："
                 "脚底高度在整段里恒定，不再随关键点噪声离地/落地"
             )
+        if config.anchor_feet_horizontal and reference.horizontal_locked:
+            notes.append(
+                f"水平脚底已锚定：双脚水平基准点做 {ground_config.horizontal_cutoff_hz:.1f} Hz "
+                f"零相位低通后反解成 root.x/z，脚底逐帧滑步 "
+                f"{reference.horizontal_drift_before_meters * 100:.1f} cm → "
+                f"{reference.horizontal_drift_after_meters * 100:.1f} cm"
+                "（剩余部分是被滤掉的逐帧噪声）；rootMotion 的 x/z 是"
+                "「脚踩住地面时髋相对脚」的运动，不是绝对走位"
+            )
     if not has_world:
         notes.append(
             "当前引擎没有输出 world landmarks（米制世界坐标），3D 关节为空；"
             "请改用 MediaPipe 引擎"
+        )
+    if (
+        config.anchor_feet_to_ground
+        and config.anchor_feet_horizontal
+        and ground_references
+        and not any(reference.horizontal_locked for reference in ground_references)
+    ):
+        notes.append(
+            "水平脚底锚定未生效：双脚同时可见的帧太少或脚点不可信，"
+            "水平方向仍用髋局部坐标（原地站立时脚可能随髋轻微漂移）"
         )
 
     measured = measure_person_height(converted)

@@ -232,7 +232,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 | 推理引擎 | `auto` 自动选择 | 可选 `auto` / `mediapipe` / `onnx`；芯片显示后端实际选择，降级时带「· 降级」 |
 | 采样间隔 | 每 1 帧 | 可选 1/2/3/5/10；目标帧率有值时优先于采样间隔 |
 | 目标帧率 | 空 | 填正数如 `15` 后按 `round(源fps / 目标fps)` 推导步长；留空提交 `null` |
-| 根运动 | `world` 保留位移 | 用 world 点 + 脚部着地锚定恢复下蹲时的髋部竖直位移；水平/前后位移单目不可恢复 |
+| 根运动 | `world` 保留位移 | 竖直位移由脚部着地锚定恢复下蹲下沉；水平位移由脚底水平锚定反解成「脚踩住地面时髋相对脚的运动」（脚不再滑步），但仍不是绝对走位 |
 | 批处理 | 4 | 可选 1/2/4/8；MediaPipe 不支持 batch，会退化为逐帧 |
 | 断点续算 | 开启 | 同时设置 `checkpoint=true` 与 `resume=true` |
 | 骨长约束拟合 | 开启 | 仅在所选引擎能输出米制 world landmarks 时生效；ONNX 引擎会置灰并关闭 |
@@ -363,6 +363,8 @@ https://storage.googleapis.com/mediapipe-models
 - ONNX 权重不自动下载：候选名包括 `rtmpose-s_256x192.onnx`、`rtmpose-m_256x192.onnx`、`rtmpose-l_384x288.onnx`、`rtmo-s_640x640.onnx`、`rtmo-m_640x640.onnx` 等，按档位在模型目录查找；也可用 `DETECT_BODY_ONNX_POSE_MODEL` 指向绝对路径。
 
 手部 21 点/手 + 面部 20 个语义点（下颌、下巴、鼻、眼睑、虹膜、嘴角、耳）增强**默认开启**（`AnalysisOptions.refinement`）。逐帧检测后，手按腕点距离匹配到最近的人（超过 0.12 归一化距离则丢弃），脸固定挂到当前帧第一个人，用于补全 AppleModel 全关节；缺 `hand_landmarker.task` / `face_landmarker.task` 或缺依赖时自动降级为纯姿态，主链路不受影响。旧版 mediapipe 不支持 `refine_landmarks` 时虹膜点回退为眼中心。
+
+手部检测**不是整帧检测**：远景全身视频里一只手只有 40~60 px，整帧的 HandLandmarker 召回实测只有三成左右，指关节缺失就意味着白膜五指整段不动。因此默认按姿态给出的腕点/肘点裁一块「手腕 ROI」（尺寸由前臂投影长度反推手长，必要时放大到 256 px），按尺度阶梯（`hand_roi_scales`，默认 `2.6 → 4.5 → 1.3` 倍手长）依次尝试、命中即停；左右手直接由 ROI 决定，不受会翻转的 handedness 影响。ROI 一只都没找到时再整帧兜底一次。同一批素材上单只手的检出率从约 30% 提升到约 85%~95%（分析结束的 `notes` 里会写明「手部检测：腕点 ROI 命中 N/M 只手」）。
 
 ### 3.6 运行时数据目录
 
@@ -638,7 +640,7 @@ AnalysisResult → 预览帧 / 姿态 JSON / 动作 JSON
 | --- | --- |
 | `sampling` | 采样计划：目标 FPS、stride、时间范围 |
 | `postprocess` | 平滑 / 补帧 / 手部稳定 / 角度 / 质检 / IK 配置 |
-| `skeleton` | 关节粒度（`include_optional` / `include_all_joints`）、`root_motion_mode`、起点归零、脚部着地锚定；无 `world/calibrated` 坐标模式，也不做镜像 |
+| `skeleton` | 关节粒度（`include_optional` / `include_all_joints`）、`root_motion_mode`、起点归零、脚部着地锚定（`anchor_feet_to_ground`）与脚底水平锚定（`anchor_feet_horizontal`）；无 `world/calibrated` 坐标模式，也不做镜像 |
 | `perf` | 队列长度、batch、分段、checkpoint / resume |
 | `refinement` | 手/脸增强：`hands=true`、`face=true`，缺模型自动降级 |
 | `ikFit` | 骨长拟合快捷覆盖；为空时取 `postprocess.ik_fit` |
@@ -685,7 +687,7 @@ TensorRT > CUDA > CoreML > DirectML > CPU
 - `smooth_landmarks=true` 时进入 `VIDEO` 模式，否则 `IMAGE`；MediaPipe 引擎本身不读取其 `tracking_ids`，但 `perf/runner.py` 会给**所有引擎**统一分配 `track_id`（单人恒为 1，多人用 IoU 跟踪），因此后处理轨迹筛选照常生效。
 - `delegate` 默认 CPU；只有 `DETECT_BODY_MEDIAPIPE_GPU_DELEGATE=true` 才请求 GPU，创建失败会记录 note 并回退 CPU。
 - 不支持 batching；`runtime.batch_size` 会退化为逐帧。
-- 手部/面部增强默认开启：手输出 21 点、脸只保留 20 个语义点（非 468 点）；手按腕点距离匹配到最近的人（超阈值丢弃），脸挂到当前帧第一个人。
+- 手部/面部增强默认开启：手输出 21 点、脸只保留 20 个语义点（非 468 点）；手按腕点距离匹配到最近的人（超阈值丢弃），脸挂到当前帧第一个人。手部优先在「腕点 ROI」里检测（尺度阶梯 + 最多一次整帧兜底），整帧检测只在 ROI 全漏时使用。
 
 ### ONNX 引擎
 
@@ -737,7 +739,7 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 | 识别设置 + 数据质检 | 导入视频后出现；两个 section 合并在同一卡片组内；底部有「清空缓存」按钮 |
 | 导出 | 导入视频后出现；按钮只有任务 `done` 时可用；顶部状态栏也有等效导出按钮 |
 | 3D 预览 | 导入视频后出现；用 ARKit 关节渲染，可拖拽旋转、滚轮缩放，显示地面网格与坐标轴 |
-| Mesh 白膜预览 | 导入视频后出现；Three.js Marching Cubes 把关键点展开为带胸腔/四肢的人形隐式曲面，头颅与五指单独建模，可拖拽旋转、滚轮缩放；白膜是姿态驱动的近似体型，不代表真实外观 |
+| Mesh 白膜预览 | 导入视频后出现；Three.js Marching Cubes 把关键点展开为带胸腔/四肢的人形隐式曲面，头颅与五指单独建模（五指逐帧按指关节的**方向**摆放、骨长钉回默认值，因此握拳/张开可见且不会变形），可拖拽旋转、滚轮缩放；白膜是姿态驱动的近似体型，不代表真实外观 |
 | 视频信息 / 运行环境 | 未导入视频时显示运行环境（版本、Python、系统、服务状态）与使用流程；导入后换成视频信息，使用流程消失 |
 | 硬件与加速 | 始终显示；可点「重新探测」；GPU 未启用加速时内嵌「GPU 加速」安装区（见「应用内 GPU 运行时安装」） |
 | 使用流程 | 仅在未导入视频时显示，引导上传 → 识别 → 导出 |
@@ -749,7 +751,7 @@ HOG 人体粗检 → 裁剪 / 仿射变换 → ONNX 推理 → SimCC / 回归解
 - 鼠标靠近关键点 14 px 内显示中文点位名、归一化 x/y/z 与置信度；检测框为青色虚线。
 - 关闭「骨架」后检测框也不会绘制；「编号」开关在窄屏隐藏但状态仍有效。
 - 骨架取「最后一个 `t <= currentTime`」的帧，不是绝对时间最近的帧；`valid=false` 时左下角提示「本帧无有效姿态（valid=false）」。
-- 3D 预览使用米制 ARKit 关节，跟随主题调整骨骼颜色，显示地面网格与坐标轴。髋高优先取后端 `PreviewFrame.hipHeight`（支撑脚跨度已做零相位平滑），只有推理进行中才退回"当前帧最低脚"，避免原地动作时整段身体被关键点噪声抖起来。
+- 3D 预览使用米制 ARKit 关节，跟随主题调整骨骼颜色，显示地面网格与坐标轴。髋高优先取后端 `PreviewFrame.hipHeight`（支撑脚跨度已做零相位平滑），水平位置取 `PreviewFrame.hipOffsetX/Z`（脚底水平锚定反解），只有推理进行中才退回"当前帧最低脚"、x/z 用 0，避免原地动作时整段身体被关键点噪声抖起来、同时脚不会在地上滑。白膜 Mesh 预览同源。
 
 ### 播放与时间轴
 
@@ -877,9 +879,9 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | --- | --- | --- |
 | `sampling` | `SamplingConfig()` | `every_n_frames=1`、`target_fps=null`、`start_s=null`、`end_s=null`、`trim_empty=false` |
 | `postprocess` | `PostProcessConfig()` | One Euro、补帧、手部稳定、角度、质检、IK、yaw 全套默认配置 |
-| `skeleton` | `SkeletonConfig()` | 不含可选关节、root motion `world`、`anchor_feet_to_ground=true`（脚部着地锚定）、`include_all_joints=false`；无坐标模式 / 镜像字段 |
+| `skeleton` | `SkeletonConfig()` | 不含可选关节、root motion `world`、`anchor_feet_to_ground=true`（脚部着地锚定）、`anchor_feet_horizontal=true`（脚底水平锚定）、`include_all_joints=false`；无坐标模式 / 镜像字段 |
 | `perf` | `RuntimeConfig()` | 队列 64、batch 4、worker 0、fp16 `auto`、分段 0、checkpoint/resume `false` |
-| `refinement` | `RefinementConfig()` | 手/脸增强：`hands=true`、`face=true`、`max_hands=2`、`num_faces=1`、`min_detection_confidence=0.5`、`hand_detection_confidence=0.4`、`hand_presence_confidence=0.35`、`refine_landmarks=true`、`hand_model=null`、`face_model=null`；缺模型自动降级 |
+| `refinement` | `RefinementConfig()` | 手/脸增强：`hands=true`、`face=true`、`max_hands=2`、`num_faces=1`、`min_detection_confidence=0.5`、`hand_detection_confidence=0.3`、`hand_presence_confidence=0.25`、`refine_landmarks=true`、`hand_model=null`、`face_model=null`；手部 ROI：`hand_roi=true`、`hand_roi_scales=(2.6,4.5,1.3)`、`hand_roi_min_box_px=64`、`hand_roi_target_px=256`、`hand_roi_wrist_visibility=0.25`、`hand_roi_full_fallback=true`；缺模型自动降级 |
 | `ikFit` / `ik_fit` | `null` | 骨长拟合快捷覆盖；HTTP 别名是 `ikFit` |
 | `engine` | `auto` | `auto` / `mediapipe` / `onnx` |
 | `max_frames` | `null` | 调试用最大帧数 |
@@ -890,8 +892,16 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 - 平滑：`method=one-euro`、`window=5`、`polyorder=2`、`extra_world_pass=true`；归一化点 x/y 的 One Euro 为 `1.0/0.5/1.0`，z 为 `0.3/0.15/1.0`；世界点另有独立一组 `1.0/1.0/1.0`，z 为 `0.3/0.3/1.0`（米制量级不同，不能共用参数）。
 - 补帧：可见度阈值 0.5、至少 6 个点、`score>=0.4`、最多补 5 帧内部缺口；片头片尾与长缺口保持 `valid=false`。
 - 手部稳定（`hand_stability`）：手部 21 点默认开启掉帧补全、姿态迟滞与相对姿态平滑；可在 A/B 时整体关闭。
-- 角度：9 个名称（左右肘/肩/膝/髋 + `torso_lean`），优先用 world 点，缺 33 点时回退归一化点，退化角由 `compute_angles()` 直接省略；导出的 `attach_angles()` 在短时遮挡时会沿用上一有效角度，默认最多保持 15 帧（`hold_occluded_frames`）。
-- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`、`root_prior_weight=0.2`、`depth_prior_weight=0.5`、`aspect_ratio` 缺省 `9/16`、`refine_tolerance=0.01`、`bone_sample_min_projected_ratio=0.85`、`symmetrize_bones=true`、`max_left_right_asymmetry=0.08`，遮挡期还有 `occlusion_weight=1.5`、`occlusion_max_frames=30`、`occlusion_jump_degrees=75`、`max_reproj_error=0.05`；只改 world 点，不改 2D 关键点。
+- 角度：11 个名称（左右肘/肩/膝/髋 + `torso_lean` + 有符号 `torso_pitch_signed_deg`，后者正=向镜头前倾、负=后仰，导出校验对它放宽到 -180~180°；+ `head_lean`，见下），优先用 world 点，缺 33 点时回退归一化点，退化角由 `compute_angles()` 直接省略；导出的 `attach_angles()` 在短时遮挡时会沿用上一有效角度，默认最多保持 15 帧（`hold_occluded_frames`）。
+- `head_lean`：头在**矢状面**的倾角（0°=颅骨中心正落在肩中点上方），终点取 `mapping.head_reference_point()`——也就是 `head_joint` 的来源，口径与导出坐标一致。不含左右分量（横向歪头会把角度读成「前倾」，那是另一件事）。它是「头前倾」唯一可量化的读数：修完再跑，站立段应当稳定在个位数度数。
+- 直立基准校准（`upright_baseline`）：默认开启；开头 60 帧里至少 10 帧满足「yaw 宽度比 ≥0.92 + 髋中点帧间位移 ≤0.02」时，取上半身 `chest.z - pelvis.z` 中位数（绝对值上限 0.25 m）从全片上半身 world z 扣除，缓解正面站立被解出躯干前倾。门控不满足时自动跳过，`enabled=false` 整体关闭。**头相对躯干的前探不在这里修**：两耳的 z 不受任何约束（见下一条），扣一个常数既抹不平逐帧变化、又只在开头窗口有效。
+- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`、`root_prior_weight=0.2`、`depth_prior_weight=0.5`、`head_depth={enabled=true, prior_scale=0, flat_boost=2.0, flat_gate_power=0, flat_gate_floor=0.6, target_forward_meters=0.09}`、`aspect_ratio` 缺省 `9/16`、`refine_tolerance=0.01`、`bone_sample_min_projected_ratio=0.85`、`symmetrize_bones=true`、`max_left_right_asymmetry=0.08`，遮挡期还有 `occlusion_weight=1.5`、`occlusion_max_frames=30`、`occlusion_jump_degrees=75`、`max_reproj_error=0.05`；只改 world 点，不改 2D 关键点。
+  - `head_depth` 是**头部专项**，分三层（缺一层就修不好「正对镜头站立却明显头前倾」）：
+    1. **骨长按解剖封顶**（`calibrate_bone_lengths`）：`head` 是「肩中点→鼻尖」，解剖长度 = `hypot(竖直跨度, HEAD_FORWARD_METERS)` ≈ 0.17~0.21 m；MediaPipe 的 world z 会把它量成 0.23~0.29 m（多出来的全是「脸朝镜头」的深度先验）。固定骨长 + 2D 投影下 `|Δz| = sqrt(L² − p²)`，多 5~10 cm 的 `L` 会**全部变成前探**，这是根因。封顶只往下压、不往上抬，侧视（深度真可观测）原样保留，并在 `fit.notes` 里报告被压掉了多少。
+    2. **压平目标不是 0**（`target_forward_meters=0.09`）：解剖上颅骨中心（两耳中点）几乎正落在肩中点铅垂线上，鼻尖在它前方 9~10 cm。把 `Δz` 压到 0 等于让鼻尖退到肩中点正上方，`head_joint` 反而落到胸后方 9 cm（看起来是仰头/脖子后缩）。
+    3. **朝输入方向回归 ×0、门控指数 0**：`depth_prior_weight` 原本会把头拉回 MediaPipe 的输入方向（自带前探先验），`depth_flat_gate_power=4` 又把压平削弱到五六成。
+  - `mapping.head_reference_point()` 只在**画面内**用两耳中点（可观测），深度一律 `nose.z − 0.09·人体朝向` 反推，并给「颅骨中心相对肩中点」的前后位置加软边界（前 4.5 cm / 后 1.1 cm，渐近饱和不跳变）。两耳不参与骨长/重投影拟合，正面机位下它们的 z 稳定前探 1.5~10 cm，直接当 `head_joint` 的深度就是「头前倾」的直接来源。
+  - 代价（有意为之）：真正"探头"的姿势也会被压平一部分（其视觉信息主要靠 2D 里鼻尖相对胸中点的下移，仍然保留）；侧对镜头时抬头/低头同样会被压住。
   - `depth_flat_weight` 是**深度压平先验**：按「骨段投影长度 / 标定骨长」的比例（`^gate_power` 门控）把不可观测的视线方向分量压向 0。正面站直的视频不会再被解成"侧视屈膝"；骨段真的朝向镜头（前伸的胳膊）时先验自动失效。设为 `0` 可回到旧行为。
   - `rigidify_failed_frames` 让 IK 被跳过的有效帧（可见度不足 / 尺度估计失败 / 2D 不自洽）也按「观测方向 + 标定骨长」重建，保证整段视频骨长恒定；单骨段位移超过 `rigidify_max_joint_shift`（默认 0.12 m）时才原样透传。
 - 质检：有效帧 ready/review 阈值 `0.95/0.8`，z 抖动 `0.01/0.03 m`，骨长 CV `0.10/0.30`，深度置信度门禁 0.6。
@@ -1213,7 +1223,7 @@ pytest tests/test_export.py -q
 3. USDZ 骨骼节点名需与 `jointNames` 一致；命名不同则在 App 侧做重映射。
 4. `left_*` 只来自人物左侧，不要按屏幕方向镜像。
 5. `valid == false` 的帧保持上一姿态，不要插值。
-6. `joints` 是相对 root 的位移；世界位移看 `rootMotion.frames`；`in_place` 模式位移恒为 0。
+6. `joints` 是相对 root 的位移；世界位移看 `rootMotion.frames`（`world` 模式下 x/z 是脚底水平锚定反解出的髋相对脚运动，y 是着地锚定的下蹲下沉）；`in_place` 模式位移恒为 0。
 7. `depthIsEstimated` 恒为 `true`。不要拿 `z` 判断人物站位或走了多远；只取关节方向 + 模型自身骨长。
 8. `warnings` 非空或 `depthConfidence < 0.6` 时，应把提示展示给用户。
 
@@ -1235,7 +1245,10 @@ pytest tests/test_export.py -q
 
 ### 根运动与世界坐标
 
-- 3D 骨骼直接使用 MediaPipe world landmarks，其原点约在两髋中点，水平位移被抹掉；`root.y` 由**脚部着地锚定**按髋到脚的跨度恢复，使下蹲时髋部下沉、脚底保持在地面（参考腿长取整段较高分位数，抗误检）。
+- 3D 骨骼直接使用 MediaPipe world landmarks，其原点约在两髋中点，整体位移被抹掉；`root.y` 由**脚部着地锚定**按髋到脚的跨度恢复，使下蹲时髋部下沉、脚底保持在地面（参考腿长取整段较高分位数，抗误检）。
+- `root.x` / `root.z` 由**脚底水平锚定**恢复：取双脚踝点、按着地高度加权，做 3 Hz 零相位低通后逐帧累加成"脚踩住地面时髋相对脚的运动"。原地站立时脚因此不再跟着髋左右/前后滑，而是髋绕脚晃；`in_place` 模式仍把这些位移清零。
+  - 它抵消的是**脚部关键点的共同位移**（身体摆动、缓慢漂移），所以脚底漂移会显著变小；剩下的只有被低通滤掉的逐帧噪声（实测 5 cm → 1 cm 量级）。
+  - 两个限界：① 它反解的是"相对脚"的位移，人物真的整体平移时会被吃掉一部分（等同原地演示）；② 单目 `z` 本身就是估计值，脚的前后锚定同样只是估计。需要绝对走位请用多机位 / 深度相机。
 - 没有 world landmarks 的引擎（ONNX/RTMPose）不产出米制关节：不再用"身高 ÷ 归一化像素跨度"反解尺度（该尺度随姿态和机位漂移，实测效果明显更差）。
 - `in_place` 根运动模式把平移全部置 0，只保留 yaw 旋转；`world` 模式允许平移。
 - `rootMotion.totalTranslation` 是**末帧相对首帧的直线距离**，不是累计行走路程；其前后（z）分量仍是单目估计值，不可用于测量走了多远。
@@ -1334,8 +1347,9 @@ ruff check app scripts tests
 | `test_desktop.py` | 空闲端口、健康检查、WebView2 状态、图标、标题、退出清理 |
 | `test_engine.py` | `PoseFrame` 序列化、bbox、引擎降级、crop、SimCC 解码、COCO17 映射、多人跟踪 |
 | `test_export.py` | 三种粒度、raw landmarks、四位小数、文件名、流式写出与回读、schema 同步、golden 样例 |
-| `test_ground_contact.py` | 脚部着地锚定：踝固定/髋下沉、可关闭、无脚帧跳过、深蹲 bundle 回归 |
+| `test_ground_contact.py` | 脚部着地锚定：踝固定/髋下沉、可关闭、无脚帧跳过、深蹲 bundle 回归；脚底水平锚定：原地站立脚不漂、抬腿不拽支撑脚、单脚可见时跳过 |
 | `test_hand_stability.py` | 手部 21 点时序稳定：缺帧复用、长缺口不伪造、单帧误检拒绝、迟滞/确认帧、左右手按腕点归属、pipeline 阶段上报 |
+| `test_hand_roi.py` | 手腕 ROI 手部检测：ROI 位置/越界平移/最小尺寸、坐标回映射、误检（远端腕点、异常尺寸）过滤、尺度阶梯命中即停、ROI 全漏时整帧兜底、姿态侧别覆盖 handedness |
 | `test_hardware_collect.py` | 系统信息采集鲁棒性与报告结构 |
 | `test_models_api.py` | 模型清单、下载进度、重复任务复用 |
 | `test_motion_clip.py` | 动作 JSON 字段、17 关节、10 Hz 重采样、可见性、骨盆升降、CLI |
@@ -1467,7 +1481,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 | 基准结果看起来很好但不真实 | `stub` 只是链路自检；真实性能需用 `--engine auto|mediapipe|onnx` 重跑 |
 | 深度结果不可信 | 检查 `depthConfidence` 与 `warnings`；按侧面机位重拍；不要把 `z` 当绝对距离 |
 | 深蹲时脚离地、髋不下沉 | 已启用脚部着地锚定：3D 预览按脚尖贴地重定位髋，`world` 模式 `root.y` 也恢复下沉；若脚踝/脚尖长期被遮挡，锚定会跳过，可先用 `skeleton.anchor_feet_to_ground=false` 做 A/B 对比 |
-| 原地跳舞（脚没动）时双脚抖动、脚底没踩实 | 单目下肢关键点的逐帧噪声会经"脚部着地锚定"被放大成整段髋部上下抖动。现已在 `skeleton/ground.py` 里对支撑脚跨度做 3 Hz 零相位高斯低通（`GroundContactConfig.smooth_cutoff_hz`，0 = 关闭）、给左右支撑脚加 2 cm 切换滞回（`switch_margin_meters`），并用两骨 IK 把支撑脚钉在平滑后的地面高度上（`lock_support_foot`，骨长不变）；3D/白膜预览改用后端平滑后的髋高（`PreviewFrame.hipHeight`），不再逐帧取"最低脚"。若仍明显，优先改成正侧机位、提高下肢可见度（`DETECT_BODY_LOWER_LIMB_RETRY_VISIBILITY`）或换 `heavy` 档模型 |
+| 原地跳舞（脚没动）时双脚抖动、脚底没踩实 | 竖直方向：单目下肢关键点的逐帧噪声会经"脚部着地锚定"被放大成整段髋部上下抖动。现已在 `skeleton/ground.py` 里对支撑脚跨度做 3 Hz 零相位高斯低通（`GroundContactConfig.smooth_cutoff_hz`，0 = 关闭）、给左右支撑脚加 2 cm 切换滞回（`switch_margin_meters`），并用两骨 IK 把支撑脚钉在平滑后的地面高度上（`lock_support_foot`，骨长不变）；3D/白膜预览改用后端平滑后的髋高（`PreviewFrame.hipHeight`）。水平方向：新增**脚底水平锚定**（`anchor_horizontal` / `horizontal_cutoff_hz`），把双脚踝点位移反解成 `root.x/z`（`PreviewFrame.hipOffsetX/Z`），脚不再跟着髋在地面上滑。若仍明显，优先改成正侧机位、提高下肢可见度（`DETECT_BODY_LOWER_LIMB_RETRY_VISIBILITY`）或换 `heavy` 档模型；也可用 `skeleton.anchor_feet_horizontal=false` 做 A/B |
 | 动作 JSON 无法还原腾空 | 单目 + 髋局部坐标只能靠着地假设还原下蹲下沉，腾空高度不可测 |
 | 左右与真实人物相反 | 源视频可能是自拍镜像；转码翻转画面或在 App 侧处理 `mirroredReference` |
 
@@ -1480,7 +1494,7 @@ macOS 签名与公证命令、AppImage / .deb 思路见 `docs/packaging.md`。�
 - `world` 模式下手指/面部关节无米制 world 观测，以姿态腕点/鼻点为锚按局部尺度估计；单目深度不可靠，指关节的前后方向仅作相对参考。
 - `mirroredReference` 固定为 `true`（与 App 样例一致）；自拍镜像需额外处理。
 - `pelvisOffsetMeters` 靠着地锚定只能还原下蹲 / 屈膝下沉，无法还原跳跃腾空。
-- 竖直方向（髋高、下蹲下沉）靠着地锚定 + 支撑脚跨度零相位低通得到；支撑脚还会被锁定在平滑后的地面高度上（单帧修正上限 `GroundContactConfig.max_foot_shift_meters`，默认 8 cm，膝由两骨 IK 重排、骨长不变），因此 `joints` 不是原始世界坐标的直接相减结果 —— 这是有意的：要让脚看起来真的踩在地上，就必须牺牲一点逐帧原始值。**水平方向**的脚部位置仍是髋局部坐标，髋左右摇摆时脚必然跟着摆，单目无法区分"脚在动"和"髋在动"，所以原地动作里脚仍可能有少量水平漂移。左右脚来回切换支撑脚造成的阶跃已由滞回 + 低通压掉。
+- 竖直方向（髋高、下蹲下沉）靠着地锚定 + 支撑脚跨度零相位低通得到；支撑脚还会被锁定在平滑后的地面高度上（单帧修正上限 `GroundContactConfig.max_foot_shift_meters`，默认 8 cm，膝由两骨 IK 重排、骨长不变），因此 `joints` 不是原始世界坐标的直接相减结果 —— 这是有意的：要让脚看起来真的踩在地上，就必须牺牲一点逐帧原始值。**水平方向**的脚部漂移由脚底水平锚定（`anchor_horizontal`，3 Hz 零相位低通 + 着地加权 + 逐帧增量）写进 `root.x/z`：脚在世界里固定、髋绕着脚晃。剩下的限界有三条：① 反解的是"相对脚"的位移，人物真的整体平移时这部分会被吃掉（等同原地演示）；② 被低通滤掉的逐帧脚点噪声仍留在脚上（厘米级）；③ 脚在整段里始终只有一只可见 / 可见度不足（`horizontal_min_both_ratio` 不满足）时锚定整段跳过，水平方向退回髋局部坐标，脚仍会跟着髋漂。`in_place` 模式把水平位移清零，锚定效果不保留在导出里（预览仍生效）。
 - ONNX 引擎只接受 COCO 17 点模型，不输出 `z` / world landmarks；多人能力只由文件名中的 `rtmo` 判断。
 - MediaPipe 引擎不直接使用其 VIDEO 模式的 `tracking_ids`；`track_id` 由 `perf/runner.py` 统一分配（单人恒为 1，多人 IoU 跟踪），后处理轨迹筛选照常生效；显式指定引擎失败也会自动降级到另一引擎。
 - 补帧只处理长度 ≤5 的内部缺口；片头片尾和长缺口保持 `valid=false`。`densify(stride>1)` 在末帧不对齐步长时可能漏掉末帧。

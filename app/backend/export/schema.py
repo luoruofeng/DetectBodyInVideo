@@ -85,8 +85,14 @@ class ExportFrame(BaseModel):
     @model_validator(mode="after")
     def _check_angles(self) -> ExportFrame:
         for name, value in self.angles.items():
-            if value < 0 or value > 180:
-                raise ValueError(f"角度 {name}={value} 超出 0~180°")
+            # 有符号俯仰角允许取负；其余三点夹角/无符号前倾角仍是 0~180°。
+            low, high = (
+                (-180.0, 180.0)
+                if name == "torso_pitch_signed_deg"
+                else (0.0, 180.0)
+            )
+            if value < low or value > high:
+                raise ValueError(f"角度 {name}={value} 超出 {low}~{high}°")
         return self
 
 

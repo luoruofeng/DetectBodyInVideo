@@ -19,6 +19,8 @@ const ANGLE_LABELS: Record<string, string> = {
   left_hip: '左髋',
   right_hip: '右髋',
   torso_lean: '躯干前倾',
+  torso_pitch_signed_deg: '躯干俯仰(正=前倾)',
+  head_lean: '头前倾',
 }
 
 const ANGLE_ORDER = Object.keys(ANGLE_LABELS)

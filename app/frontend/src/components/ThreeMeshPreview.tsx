@@ -43,6 +43,8 @@ interface SceneRefs {
   pending: {
     joints: JointMap
     hipHeight: number
+    hipOffsetX: number
+    hipOffsetZ: number
     fingers: { left: FingerChains; right: FingerChains }
   } | null
   lastBuild: number
@@ -69,6 +71,11 @@ const FIELD_BLEND_FLOOR = FIELD_ISOLATION * 0.25
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
+}
+
+/** 后端水平锚定偏移；缺失/NaN 时退回 0（推理中还没有后处理结果）。 */
+function finiteOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
 /**
@@ -346,6 +353,9 @@ export function ThreeMeshPreview({ frame, showGrid, theme }: ThreeMeshPreviewPro
         refs.pending = null
         refs.lastBuild = performance.now()
         refs.group.position.y = pending.hipHeight
+        // 水平锚定偏移：不加这一步，原地站立时双脚会随髋的局部坐标在地面上滑动。
+        refs.group.position.x = pending.hipOffsetX
+        refs.group.position.z = pending.hipOffsetZ
         rebuildSurface(refs.surface, pending.joints)
         updateParts(refs, pending.joints, pending.fingers)
         refs.surface.visible = true
@@ -424,6 +434,8 @@ export function ThreeMeshPreview({ frame, showGrid, theme }: ThreeMeshPreviewPro
     refs.pending = {
       joints: refs.smoothed,
       hipHeight: resolveHipHeight(frame, refs.smoothed),
+      hipOffsetX: finiteOrZero(frame.hipOffsetX),
+      hipOffsetZ: finiteOrZero(frame.hipOffsetZ),
       fingers: {
         left: readFingerChains(frame, 'left'),
         right: readFingerChains(frame, 'right'),

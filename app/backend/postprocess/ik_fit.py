@@ -48,6 +48,8 @@ from app.backend.skeleton.topology import (
     BONE_SEGMENTS,
     CHEST,
     CORE_INDICES,
+    HEAD,
+    HEAD_FORWARD_METERS,
     NODES,
     PELVIS,
     NodeSpec,
@@ -93,6 +95,63 @@ SYMMETRIC_PAIRS: tuple[tuple[str, str], ...] = (
 # --------------------------------------------------------------------------- #
 # 配置与报告
 # --------------------------------------------------------------------------- #
+class HeadDepthConfig(BaseModel):
+    """``head``（胸中点 → 鼻尖）骨段的深度专项先验。
+
+    为什么单独给头一组参数：正面机位下头的前后位置**完全没有观测**，``|Δz|`` 被骨长
+    与 2D 投影长度定死、只剩符号。默认的 ``depth_prior_weight`` 会把方向拉回 MediaPipe
+    的输入方向（而输入方向本身就带"脸朝镜头"的先验），``depth_flat`` 又被 ``ratio⁴``
+    门控削弱到基准的五六成 —— 两者平衡的结果就是"直立站着头稳定前探几厘米"。
+
+    这里做三件事，缺一不可：
+
+    1. **压平加强、不再朝输入方向回归**（``flat_boost`` / ``prior_scale``）；
+    2. **压平目标不是 0**（``target_forward_meters``）：解剖上鼻尖本来就在肩中点前方
+       约 9 cm，"把 Δz 压到 0"等于让鼻尖退到肩中点正上方，头中心（两耳中点）反而
+       落到胸后方 9 cm —— 前探和仰头都是这么来的；
+    3. **骨长按解剖上限封顶**（见 ``calibrate_bone_lengths``）：头骨段的 3D 距离里
+       有一大截是 MediaPipe 的深度先验，当成骨长固定下来就会把"多出来的长度"全部
+       变成 Δz。
+
+    代价（有意为之）：真正把脖子往前探的姿势也会被压平一部分。可接受，因为那种幅度
+    主要靠"鼻尖相对胸中点往下掉"的 2D 位移表达，仍然保留。
+    """
+
+    enabled: bool = True
+    prior_scale: float = Field(
+        0.0,
+        ge=0,
+        le=1,
+        description="头部方向朝初始方向（d0）回归的系数；0 = 不让 d0 把头部拽回前探位",
+    )
+    flat_boost: float = Field(
+        2.0, ge=0, le=10, description="头部深度压平权重的倍数（1 = 与其它骨段一致）"
+    )
+    flat_gate_power: float = Field(
+        0.0,
+        ge=0,
+        le=8,
+        description="头部压平门控指数；0 = 不随投影比衰减（头部骨段在正面机位下恒被压平）",
+    )
+    flat_gate_floor: float = Field(
+        0.6,
+        ge=0,
+        le=1,
+        description="投影比下限：即使骨段几乎躺在画面平面内，也至少按该比例给压平权重",
+    )
+    target_forward_meters: float = Field(
+        HEAD_FORWARD_METERS,
+        ge=0,
+        le=0.3,
+        description="头部深度目标：鼻尖应位于胸中点（两肩中点）**前方**该距离（米）。"
+        "解剖上颅骨中心几乎正落在肩中点铅垂线上，鼻尖在它前方 9~10 cm，"
+        "所以 Δz(鼻尖−胸中点) 的目标是 −9 cm 而不是 0。它同时管住三件事："
+        "方向（不许后仰/缩脖子）、幅度（骨长被封顶时不许再往前顶）、"
+        "低头时不许把'鼻尖往下掉'翻译成'头往前探'；填 0 回到"
+        "「把鼻尖压到肩中点正上方」的旧行为",
+    )
+
+
 class FitConfig(BaseModel):
     """骨长约束拟合的参数。默认开启；``enabled=False`` 时输出与改动前逐位一致。"""
 
@@ -161,6 +220,11 @@ class FitConfig(BaseModel):
         ge=0,
         le=1,
         description="方向先验只采信置信度不低于该值的骨段；摆动腿通常 0.8+，支撑腿被折扣后低于它",
+    )
+    head_depth: HeadDepthConfig = Field(
+        default_factory=HeadDepthConfig,
+        description="头部骨段（胸中点→鼻尖）的深度专项：单目正面机位下它只剩一个先验，"
+        "必须压得比其它骨段更狠、且不朝输入方向回归，否则「直立站着头前探」会稳定残留",
     )
     depth_sparsity_weight: float = Field(
         0.0,
@@ -600,11 +664,16 @@ def calibrate_bone_lengths(
     中位数不是简单地对所有帧取：只有「骨段正对镜头」的帧才进样本
     （见 ``bone_sample_min_projected_ratio``），因为沿视线方向的深度噪声只会把骨段量长。
     某条骨段的正对帧太少时退回全样本，避免极端机位下无样本可用。
+
+    例外是 ``head``（肩中点→鼻尖）：它 3D 距离里那一大截深度本身就是 MediaPipe 的
+    "脸朝镜头"先验，不是可观测的骨长。这里用「2D 可见的竖直跨度 + 解剖前伸量
+    ``HEAD_FORWARD_METERS``」给它封顶，只往下压、不往上抬，见下方 ``head_vertical``。
     """
     config = config or FitConfig()
     aspect = config.aspect_ratio or DEFAULT_ASPECT
     series: dict[str, list[float]] = {node.key: [] for node in BONE_SEGMENTS}
     frontal: dict[str, list[float]] = {node.key: [] for node in BONE_SEGMENTS}
+    head_vertical: list[float] = []
     shoulders: list[float] = []
     hips: list[float] = []
 
@@ -625,6 +694,10 @@ def calibrate_bone_lengths(
             if value <= 1e-6:
                 continue
             series[node.key].append(value)
+            if node.key == HEAD:
+                # 2D 能看见的那一部分（竖直跨度，米）：头前倾/低头都不会改变它太多，
+                # 但深度先验会；配合解剖前伸量就能把"被吹大的骨长"顶掉。
+                head_vertical.append(abs(float(child[1] - parent[1])))
             if _gate_eligible(node):
                 ratio = _projected_ratio(node, flat, value, scale) if flat else None
                 if ratio is None or ratio >= config.bone_sample_min_projected_ratio:
@@ -637,6 +710,7 @@ def calibrate_bone_lengths(
     lengths: dict[str, float] = {}
     clamped: list[str] = []
     gated: list[str] = []
+    head_capped = 0.0
     for node in BONE_SEGMENTS:
         values = series.get(node.key) or []
         chosen = frontal.get(node.key) or []
@@ -648,9 +722,25 @@ def calibrate_bone_lengths(
         length = clamp_to_range(median, node)
         if abs(length - median) > 1e-6:
             clamped.append(node.key)
+        if node.key == HEAD and head_vertical:
+            # 肩中点→鼻尖的**解剖**长度：竖直跨度（2D 可见）+ 前伸 ``HEAD_FORWARD_METERS``。
+            # 实测 3D 距离 0.23~0.29 m，比解剖值长 5~10 cm —— 那一段全是"脸朝镜头"的
+            # 深度先验；当成骨长固定下来后，|Δz| = sqrt(L² − p²) 只能把多出来的长度
+            # 变成头前探。取 min 只在"被吹大"时生效，侧视（深度真的可观测）原样保留。
+            # 放在 clamp 之后：这是本视频的实际几何，不该再被静态区间抬回去。
+            anatomical = math.hypot(float(np.median(head_vertical)), HEAD_FORWARD_METERS)
+            if anatomical < length:
+                head_capped = length - anatomical
+                length = anatomical
         lengths[node.key] = round(length, 5)
 
     notes: list[str] = []
+    if head_capped > 1e-6:
+        notes.append(
+            f"头骨段（肩中点→鼻尖）实测长度比解剖上限长 {head_capped * 100:.1f} cm，"
+            f"已按「竖直跨度 + 前伸 {HEAD_FORWARD_METERS:.2f} m」封顶："
+            "多出来的长度只可能来自深度先验，固定成骨长就会变成头前探"
+        )
     if gated and config.bone_sample_min_projected_ratio > 0:
         notes.append(
             f"{len(gated)} 条骨段只用了正对镜头的帧估长度"
@@ -794,11 +884,13 @@ class _FrameContext:
         "base",
         "d0",
         "flat_scale",
+        "flat_target",
         "fk_terms",
         "held_dir",
         "held_idx",
         "held_weight",
         "initial",
+        "prior_gain",
         "prior_scale",
         "e1",
         "e2",
@@ -857,7 +949,8 @@ def _flat_scale(
     flat = np.zeros(len(nodes), dtype=np.float64)
     if config.depth_flat_weight <= 0 or scale <= 1e-9:
         return flat
-    power = max(0.0, float(config.depth_flat_gate_power))
+    baseline_power = max(0.0, float(config.depth_flat_gate_power))
+    head = config.head_depth
     base = math.sqrt(float(config.depth_flat_weight)) * scale
     for i, node in enumerate(nodes):
         if node.parent is None:
@@ -871,7 +964,14 @@ def _flat_scale(
             continue
         projected = float(math.hypot(child[0] - parent[0], child[1] - parent[1]))
         ratio = min(1.0, max(0.0, projected / expected))
-        flat[i] = base * (ratio**power)
+        power = baseline_power
+        boost = 1.0
+        if head.enabled and node.key == HEAD:
+            # 头部：不衰减（power=0）+ 整体加强，让"压平"赢过朝 d0 的回归项
+            power = float(head.flat_gate_power)
+            boost = float(head.flat_boost)
+            ratio = max(float(head.flat_gate_floor), ratio)
+        flat[i] = base * boost * (ratio**power)
     return flat
 
 
@@ -1099,6 +1199,13 @@ def _make_context(
     # 有方向先验的骨段深度幅度由方向项说了算，压平先验必须整体让位
     if dir_idx.size:
         flat_scale[dir_idx] = 0.0
+    # 压平目标：默认 0（"贴着正面平面"），但头部骨段不行 —— 鼻尖解剖上就在胸中点前方
+    # 9~10 cm，压到 0 会把颅骨中心（两耳中点）顶到胸后方同样距离。
+    # 非零目标只给头骨段（见下方残差）。
+    flat_target = np.zeros(len(NODES), dtype=np.float64)
+    if config.head_depth.enabled and flat_scale[index_of[HEAD]] > 0:
+        # 世界坐标 -z = 靠近镜头，所以"前方 9 cm"的目标值是负的
+        flat_target[index_of[HEAD]] = -float(config.head_depth.target_forward_meters)
     reproj_rows: list[int] = []
     obs_u: list[float] = []
     obs_v: list[float] = []
@@ -1175,6 +1282,17 @@ def _make_context(
     context.prior_scale = (
         math.sqrt(config.depth_prior_weight) * max(1e-6, scale) * float(np.mean(length[1:]))
     )
+    # 逐骨段的方向回归强度：默认全部等于 prior_scale，头部按 head_depth.prior_scale 打折。
+    # 头部那一项是"朝 MediaPipe 输入方向回归"，而输入方向本身就带脸朝镜头的前伸先验，
+    # 不把它关掉，压平先验再强也会被拉回一半（实测就是"直立时头稳定前探几厘米"）。
+    prior_gain = np.full(
+        2 * (len(NODES) - 1), context.prior_scale, dtype=np.float64
+    )
+    head_position = index_of.get(HEAD)
+    if config.head_depth.enabled and head_position:
+        offset = 2 * (head_position - 1)
+        prior_gain[offset : offset + 2] *= float(config.head_depth.prior_scale)
+    context.prior_gain = prior_gain
     context.d0 = d0
     context.e1 = e1
     context.e2 = e2
@@ -1204,6 +1322,7 @@ def _make_context(
     ]
     context.parent = parent
     context.flat_scale = flat_scale
+    context.flat_target = flat_target
     context.sign_idx = sign_idx
     context.sign_value = sign_value
     context.sign_weight = sign_weight
@@ -1428,11 +1547,12 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
         error = (directions - context.held_dir) * context.held_weight[:, None]
         parts.append(error.ravel())
 
-    # 深度压平：把每条骨段沿视线的分量压向 0。权重按"该骨段有多贴合画面平面"门控，
-    # 于是正面站直的小腿不会被解成屈膝，而正面伸向镜头的胳膊依然保留真实深度。
+    # 深度压平：把每条骨段沿视线的分量压向**目标值**（默认 0）。权重按"该骨段有多贴合
+    # 画面平面"门控，于是正面站直的小腿不会被解成屈膝，而正面伸向镜头的胳膊依然保留真实
+    # 深度。头部骨段的目标是 −9 cm（鼻尖在胸中点前方），见 ``HeadDepthConfig``。
     if float(np.max(context.flat_scale)) > 0:
         local_z = positions[1:, 2] - positions[context.parent[1:], 2]
-        parts.append(local_z * context.flat_scale[1:])
+        parts.append((local_z - context.flat_target[1:]) * context.flat_scale[1:])
 
     # 深度符号先验（hinge）：只在"Δz 与先验反号"时施加惩罚。
     # 符号正确时残差为 0、梯度为 0 → 不抢 2D 重投影与骨长硬约束的任何自由度；
@@ -1468,7 +1588,9 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
     # 这样在不动点处（偏移回到 0）这项的梯度自动为 0，不会像"位置先验"那样
     # 每次都把解往新一轮的输入处拉，从而保证"再拟合一次"几乎不动。
     if context.prior_scale > 0:
-        parts.append(params[ROOT_PARAMS:] * context.prior_scale)
+        # 逐骨段的 gain：头部通常被 head_depth.prior_scale 置 0，不再朝 d0 回归，
+        # 于是深度压平（或符号/方向先验）成为唯一决定头部深度的项。
+        parts.append(params[ROOT_PARAMS:] * context.prior_gain)
 
     if context.prev is not None and context.temporal_scale > 0:
         delta = positions - context.prev
@@ -1927,6 +2049,13 @@ def fit_frames(
         notes.append("未安装 scipy，拟合被跳过")
     if passes > 1:
         notes.append(f"迭代细化 {p + 1} 趟（收敛阈值 {config.refine_tolerance * 100:.1f} cm）")
+    if config.enabled and config.head_depth.enabled:
+        notes.append(
+            "头部骨段深度专项：压平权重 ×"
+            f"{config.head_depth.flat_boost:.1f}、门控指数 {config.head_depth.flat_gate_power:.1f}、"
+            f"朝输入方向回归 ×{config.head_depth.prior_scale:.2f}"
+            "（正面机位下头的前后位置无观测，只能靠这个先验站在颈上方）"
+        )
 
     return result, FitReport(
         applied=bool(fitted_reports),
@@ -1984,6 +2113,7 @@ __all__ = [
     "FitConfig",
     "FitReport",
     "FrameFitReport",
+    "HeadDepthConfig",
     "FrameFitter",
     "bone_length_cv",
     "calibrate_bone_lengths",

@@ -7,8 +7,10 @@
   - ``world``：带位移播放（默认）；
   - ``in_place``：固定 root（位移归零，只保留旋转），适合原地动画/卡点视频。
 
-注意：MediaPipe world landmarks 以髋为原点，整体位移会被抹掉；
-竖直方向由脚部着地锚定补回下蹲下沉，水平/前后位移无法恢复；
+注意：MediaPipe world landmarks 以髋为原点，绝对位移会被抹掉；
+竖直方向由脚部着地锚定补回下蹲下沉，水平方向由**脚底水平锚定**反解出
+"脚踩住地面时髋相对脚怎么动"（脚不滑步，髋绕脚晃）；
+两者都不是绝对走位：人物真的整体平移时，水平分量会被吃掉一部分；
 ``total_translation`` 是首尾净位移，不是累计路程。
 """
 
@@ -154,8 +156,8 @@ def build_root_motion(
         track.notes.append("原地模式：translation 全为 0，仅保留旋转")
     else:
         track.notes.append(
-            "world landmarks 以髋为原点：x/z 位移不可恢复，"
-            "y 位移来自脚部着地锚定的髋部下沉"
+            "world landmarks 以髋为原点：y 位移来自脚部着地锚定的髋部下沉，"
+            "x/z 来自脚底水平锚定（脚踩住地面时髋相对脚的运动），不是绝对走位"
         )
 
     return track

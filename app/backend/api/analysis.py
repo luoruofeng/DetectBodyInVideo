@@ -79,6 +79,15 @@ class PreviewFrame(BaseModel):
         description="髋到最低着地点（踝/脚尖）的竖直距离（米，已做零相位平滑）。"
         "3D 预览用它把脚底放到地面；缺省表示该帧没有可信的着地参考",
     )
+    hipOffsetX: float = Field(
+        0.0,
+        description="髋相对双脚水平基准点的横向偏移（米，已做零相位平滑）。"
+        "3D 预览把它加到髋位置上，脚才不会跟着髋在地面上滑动；缺省 0 表示没有水平锚定",
+    )
+    hipOffsetZ: float = Field(
+        0.0,
+        description="髋相对双脚水平基准点的前后偏移（米，深度的估计值）。含义同 hipOffsetX",
+    )
 
 
 class FramesPayload(BaseModel):
@@ -285,6 +294,8 @@ def get_frames(
                     and converted.ground_span > 0
                     else None
                 ),
+                hipOffsetX=round(converted.root.x, 4) if converted is not None else 0.0,
+                hipOffsetZ=round(converted.root.z, 4) if converted is not None else 0.0,
             )
         )
 

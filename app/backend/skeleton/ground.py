@@ -17,8 +17,20 @@
    位置（``lock_support_foot``）。只做第 4 步的话，髋虽然稳了，脚相对髋的竖直
    位置仍是逐帧估计值，看到的就是"整个人在上下颠 + 脚在离地/落地之间抖"。
 
-竖直方向之外一律不动：``joints`` 仍是髋局部坐标（导出契约不变），x/z 位移不伪造，
-腾空帧（span 大于参考值）表现为髋略高于参考位，而不是被强行按回地面。
+竖直方向稳定之后还剩一个问题：``joints`` 是**髋局部坐标**，髋左右/前后一晃，
+脚在渲染里就跟着晃 —— 这就是"原地站着却一直没踩实、脚在地上漂"的来源。
+第 6 步专门处理它：
+
+6. 取两脚踝点、按"脚越低权重越大"合成水平基准点，先做零相位低通，再按
+   "脚在地上时它相对身体的位置只因身体位移而变"逐帧累加成 ``root.x`` / ``root.z``
+   （``anchor_horizontal``）。脚在水平面里被固定在原地，髋绕着脚晃，而不是脚跟着
+   髋漂。用增量（而不是"锚点 − 基准"）是为了换脚/单脚离地时 root 保持连续、不跳变。
+
+``joints`` 仍是髋局部坐标（导出契约不变）。水平锚定只是把"身体相对脚"的位移
+写进 ``root.x/z``，所以 world 模式的 ``rootMotion.translation`` 现在也带水平分量：
+它描述的是"脚踩住地面时髋相对脚怎么动"，**不是绝对走位**（人物真的横移时，
+水平位移会被吃掉一部分，等同原地演示）。腾空帧（span 大于参考值）表现为髋略高于
+参考位，而不是被强行按回地面。
 """
 
 from __future__ import annotations
@@ -109,6 +121,50 @@ class GroundContactConfig(BaseModel):
         description="单帧允许修正的脚部位移上限（米）。超过说明这一帧的跨度和脚观测本身就矛盾"
         "（误检/极端遮挡），该帧跳过锁定而不是把腿掰断",
     )
+    anchor_horizontal: bool = Field(
+        True,
+        description="水平脚底锚定：把双脚踝点轨迹按着地权重合成水平基准点，做零相位低通后"
+        "逐帧累加成 root.x/z，使脚在水平面上固定在原地、髋绕脚晃动。关闭后水平方向退回"
+        "旧行为（脚随髋局部坐标漂移）",
+    )
+    horizontal_cutoff_hz: float = Field(
+        3.0,
+        ge=0.0,
+        le=20.0,
+        description="水平基准点的零相位高斯低通截止频率（Hz）。0 = 不平滑"
+        "（脚被逐帧钉死，髋会跟着关键点噪声左右抖）",
+    )
+    horizontal_weight_meters: float = Field(
+        0.15,
+        gt=0,
+        le=1.0,
+        description="双脚着地加权的软阈值（米）：某只脚比最低的那只高出该量时，"
+        "它在水平基准点里的权重降到 1/e。取大值（≈0.15）等于「两脚都在地上时取平均」"
+        "——两只脚的世界坐标噪声是独立的，平均能把噪声减半；取很小的值就等于"
+        "「只用支撑脚」，抬腿时不会把支撑脚拽走，代价是非支撑脚自己的噪声全留在画面上",
+    )
+    max_horizontal_offset_meters: float = Field(
+        0.5,
+        gt=0,
+        le=2.0,
+        description="root 水平偏移的硬上限（米，相对首个有效帧）。正常站立只有几厘米；"
+        "触及上限说明脚的关键点本身崩了（误检/长时遮挡），"
+        "此时宁可留一点漂移也不要把人挪出画面",
+    )
+    max_horizontal_step_meters: float = Field(
+        0.1,
+        gt=0,
+        le=1.0,
+        description="单帧允许累加的 root 水平修正上限（米）。超过说明这一帧的脚点跳变"
+        "（误检 / 支撑脚切换瞬间），按比例缩放而不是让整个人弹一下",
+    )
+    horizontal_min_both_ratio: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="双脚同时可见的帧占比低于该值时不启用水平锚定：只有一只脚时"
+        "支撑脚判定和脚点都不可靠，宁可不锚定也不要凭空把身体挪走",
+    )
 
 
 class GroundReference(BaseModel):
@@ -122,6 +178,15 @@ class GroundReference(BaseModel):
     )
     span_jitter_after_meters: float = Field(
         0.0, description="平滑后支撑脚跨度的逐帧变化 RMS（米）"
+    )
+    horizontal_locked: bool = Field(
+        False, description="是否启用了水平脚底锚定（结果写进 root.x/root.z）"
+    )
+    horizontal_drift_before_meters: float = Field(
+        0.0, description="锚定前脚在水平面里偏离中位的 90 分位半径（米），即肉眼看到的滑步"
+    )
+    horizontal_drift_after_meters: float = Field(
+        0.0, description="锚定后残余的水平漂移 RMS（米）：只剩被低通滤掉的逐帧噪声"
     )
 
 
@@ -175,6 +240,71 @@ def foot_span(frame: ConvertedFrame, config: GroundContactConfig | None = None) 
         if span is not None
     ]
     return max(values) if values else None
+
+
+def side_foot_base(
+    frame: ConvertedFrame,
+    side: str,
+    config: GroundContactConfig | None = None,
+) -> tuple[float, float, float] | None:
+    """单只脚的水平参考点：返回 ``(x, z, 到髋的竖直距离)``。
+
+    优先用踝点：脚尖点在 world 坐标里前后摆动更明显（MediaPipe 对脚趾的估计更差），
+    拿它当基准会把脚尖噪声写进 root.z。踝点不可见时才退回脚尖。
+    """
+    config = config or GroundContactConfig()
+    span = side_foot_span(frame, side, config)
+    if span is None:
+        return None
+    for name in SIDE_FOOT_JOINTS.get(side, ()):
+        point = frame.joints.get(name)
+        if point is None or point.visibility < config.min_visibility:
+            continue
+        if not (math.isfinite(point.x) and math.isfinite(point.z)):
+            continue
+        return (point.x, point.z, span)
+    return None
+
+
+def _combine_foot_base(
+    entries: Sequence[tuple[float, float, float]], weight_scale: float
+) -> tuple[float, float] | None:
+    """按"脚越低权重越大"把左右脚的位置合成一个水平基准点（诊断/工具用）。"""
+    if not entries:
+        return None
+    if len(entries) == 1:
+        return (entries[0][0], entries[0][1])
+    lowest = max(entry[2] for entry in entries)
+    weights = [
+        math.exp(-max(0.0, lowest - entry[2]) / weight_scale) for entry in entries
+    ]
+    total = sum(weights)
+    if total <= 0:  # pragma: no cover - 权重恒为正，不会走到
+        return (entries[0][0], entries[0][1])
+    return (
+        sum(weight * entry[0] for weight, entry in zip(weights, entries, strict=True)) / total,
+        sum(weight * entry[1] for weight, entry in zip(weights, entries, strict=True)) / total,
+    )
+
+
+def foot_base_xz(
+    frame: ConvertedFrame, config: GroundContactConfig | None = None
+) -> tuple[float, float] | None:
+    """双脚水平基准点（米，髋局部坐标，按着地高度加权）。
+
+    只作诊断/工具用途：真正参与 ``root.x/z`` 反解的是 ``_horizontal_offsets`` 里的
+    **增量式脚底锁定**（见该函数的说明），不是这个单帧基准点。
+    """
+    config = config or GroundContactConfig()
+    entries = [
+        entry
+        for entry in (
+            side_foot_base(frame, "left", config),
+            side_foot_base(frame, "right", config),
+        )
+        if entry is not None
+    ]
+    return _combine_foot_base(entries, config.horizontal_weight_meters)
 
 
 def _percentile(values: Sequence[float], quantile: float) -> float:
@@ -271,6 +401,18 @@ def _finite_diff_rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.diff(values) ** 2)))
 
 
+def _planar_scatter_meters(xs: np.ndarray, zs: np.ndarray) -> float:
+    """水平面里偏离中位的 90 分位半径（米）：脚在地面上"漂"多远。
+
+    用分位数而不是 RMS：单帧误检（脚点飞到半米外）会把 RMS 整个带偏，
+    而报告这个数字是为了说明"漂移被压掉多少"，必须对离群值稳健。
+    """
+    if xs.size == 0:
+        return 0.0
+    radii = np.hypot(xs - float(np.median(xs)), zs - float(np.median(zs)))
+    return float(np.percentile(radii, 90))
+
+
 def _zero_phase_lowpass(
     values: np.ndarray, step_seconds: float, cutoff_hz: float
 ) -> np.ndarray:
@@ -317,6 +459,179 @@ def _fill_missing(
         nearest = min(available, key=lambda candidate: abs(candidate - index))
         filled[index] = span_by_index[nearest]
     return filled
+
+
+def _fill_missing_points(
+    points_by_index: dict[int, tuple[float, float]], valid_indexes: Sequence[int]
+) -> dict[int, tuple[float, float]]:
+    """同 ``_fill_missing``，但补的是 ``(x, z)`` 水平基准点。"""
+    if not points_by_index:
+        return {}
+    available = sorted(points_by_index)
+    filled = dict(points_by_index)
+    for index in valid_indexes:
+        if index in filled:
+            continue
+        nearest = min(available, key=lambda candidate: abs(candidate - index))
+        filled[index] = points_by_index[nearest]
+    return filled
+
+
+def _side_trajectories(
+    frames: Sequence[ConvertedFrame], config: GroundContactConfig
+) -> dict[int | None, dict[str, dict[int, tuple[float, float, float]]]]:
+    """逐帧逐脚的水平位置：``{track: {side: {index: (x, z, 到髋的竖直距离)}}}``。"""
+    series: dict[int | None, dict[str, dict[int, tuple[float, float, float]]]] = {}
+    for frame in sorted(frames, key=lambda item: item.index):
+        if not frame.valid:
+            continue
+        for side in ("left", "right"):
+            base = side_foot_base(frame, side, config)
+            if base is None:
+                continue
+            series.setdefault(frame.track_id, {}).setdefault(side, {})[frame.index] = base
+    return series
+
+
+def _horizontal_offsets(
+    frames: Sequence[ConvertedFrame],
+    config: GroundContactConfig,
+    valid_indexes: dict[int | None, list[int]],
+) -> tuple[
+    dict[int | None, dict[int, tuple[float, float]]],
+    dict[int | None, tuple[float, float]],
+]:
+    """水平脚底锚定：返回 ``({track: {index: root 水平偏移}}, {track: (锚定前, 锚定后)})``。
+
+    **增量式脚底锁定**：脚踩在地上时，它相对身体的位置只会因为身体整体位移而变，
+    所以 ``root(t) = root(t-1) − 双脚逐帧位移的加权平均``。位移里的共同分量
+    （身体晃动、真实走位）被完整抵掉，脚因此钉在原地、髋绕脚晃；只剩被低通滤掉的
+    逐帧噪声留在脚上（厘米级），而不是整段慢慢漂走。
+
+    几个刻意的选择：
+
+    - 平均的对象是**逐帧位移**，不是位置：两脚都着地时它们相对身体的位移相同，
+      平均只会压低各自的独立噪声；抬起的那只脚位移完全不同，按高度权重排掉即可。
+      如果改平均位置，换脚/抬腿会让基准点整体平移，支撑脚反而被拽着滑半个站距。
+    - 用**增量**而不是"锚点 − 基准"：同样是为了让 root 在换脚、遮挡时保持连续，不跳变。
+    - 逐帧增量在 ``max_horizontal_step_meters`` 处按比例缩放：脚点误检不至于让整个人弹一下。
+    - 轨迹先做零相位低通，避免把逐帧关键点噪声积分成一段随机游走。
+    """
+    if not config.anchor_horizontal:
+        return {}, {}
+    trajectories = _side_trajectories(frames, config)
+    if not trajectories:
+        return {}, {}
+    step_seconds = _frame_step_seconds(frames)
+    max_offset = config.max_horizontal_offset_meters
+    max_step = config.max_horizontal_step_meters
+    offsets: dict[int | None, dict[int, tuple[float, float]]] = {}
+    metrics: dict[int | None, tuple[float, float]] = {}
+    for track_id, sides in trajectories.items():
+        index_set = set(sides.get("left", {})) | set(sides.get("right", {}))
+        if len(index_set) < 2:
+            continue
+        both = sum(
+            1
+            for index in index_set
+            if index in sides.get("left", {}) and index in sides.get("right", {})
+        )
+        if both / len(index_set) < config.horizontal_min_both_ratio:
+            # 长期只有一只脚可见：基准点会随遮挡来回跳，宁可不锚定。
+            continue
+
+        smoothed: dict[str, dict[int, tuple[float, float]]] = {}
+        for side, by_index in sides.items():
+            keys = sorted(by_index)
+            raw_x = np.asarray([by_index[index][0] for index in keys], dtype=np.float64)
+            raw_z = np.asarray([by_index[index][1] for index in keys], dtype=np.float64)
+            smooth_x = _zero_phase_lowpass(raw_x, step_seconds, config.horizontal_cutoff_hz)
+            smooth_z = _zero_phase_lowpass(raw_z, step_seconds, config.horizontal_cutoff_hz)
+            smoothed[side] = _fill_missing_points(
+                {
+                    index: (float(x), float(z))
+                    for index, x, z in zip(keys, smooth_x.tolist(), smooth_z.tolist(), strict=True)
+                },
+                valid_indexes.get(track_id, []),
+            )
+
+        root_x = 0.0
+        root_z = 0.0
+        previous: dict[str, tuple[float, float, float]] | None = None
+        by_index_out: dict[int, tuple[float, float]] = {}
+        raw_points: list[tuple[float, float]] = []
+        locked_points: list[tuple[float, float]] = []
+        for index in sorted(index_set):
+            current: dict[str, tuple[float, float, float]] = {}
+            for side in ("left", "right"):
+                raw = sides.get(side, {}).get(index)
+                smooth = smoothed.get(side, {}).get(index)
+                if raw is None or smooth is None:
+                    continue
+                current[side] = (smooth[0], smooth[1], raw[2])
+            if not current:
+                continue
+            if previous:
+                # 关键：平均的是**逐帧位移**而不是位置。两脚都着地时它们相对身体的
+                # 位移相同，平均只压低噪声；抬起的那只脚位移完全不同，按高度权重
+                # 排掉即可，不会像"平均位置"那样把基准点整体拽到支撑脚上。
+                lowest = max(entry[2] for entry in current.values())
+                steps: list[tuple[float, float, float]] = []
+                for side, (smooth_x, smooth_z, span) in current.items():
+                    prev = previous.get(side)
+                    if prev is None:
+                        continue
+                    weight = math.exp(
+                        -max(0.0, lowest - span) / config.horizontal_weight_meters
+                    )
+                    steps.append(
+                        (
+                            prev[0] - smooth_x,
+                            prev[1] - smooth_z,
+                            weight,
+                        )
+                    )
+                total_weight = sum(step[2] for step in steps)
+                if total_weight > 0:
+                    step_x = sum(step[0] * step[2] for step in steps) / total_weight
+                    step_z = sum(step[1] * step[2] for step in steps) / total_weight
+                    length = math.hypot(step_x, step_z)
+                    if length > max_step:
+                        scale = max_step / length
+                        step_x *= scale
+                        step_z *= scale
+                    root_x = min(max_offset, max(-max_offset, root_x + step_x))
+                    root_z = min(max_offset, max(-max_offset, root_z + step_z))
+            by_index_out[index] = (root_x, root_z)
+            previous = current
+            raw_entries = [
+                sides[side][index] for side in current if index in sides.get(side, {})
+            ]
+            raw_base = _combine_foot_base(raw_entries, config.horizontal_weight_meters)
+            if raw_base is not None:
+                raw_points.append(raw_base)
+                locked_points.append((root_x + raw_base[0], root_z + raw_base[1]))
+        if not by_index_out:
+            continue
+
+        # 脚被遮挡 / 无效帧沿用最近的修正值，不要突然回到 0。
+        filled: dict[int, tuple[float, float]] = {}
+        latest = (0.0, 0.0)
+        for index in valid_indexes.get(track_id, []):
+            latest = by_index_out.get(index, latest)
+            filled[index] = latest
+        offsets[track_id] = filled
+        metrics[track_id] = (
+            _planar_scatter_meters(
+                np.asarray([point[0] for point in raw_points], dtype=np.float64),
+                np.asarray([point[1] for point in raw_points], dtype=np.float64),
+            ),
+            _planar_scatter_meters(
+                np.asarray([point[0] for point in locked_points], dtype=np.float64),
+                np.asarray([point[1] for point in locked_points], dtype=np.float64),
+            ),
+        )
+    return offsets, metrics
 
 
 def _leg_ik(
@@ -447,10 +762,12 @@ def anchor_feet_to_ground(
 ) -> tuple[list[ConvertedFrame], list[GroundReference]]:
     """把脚底固定在地面、髋随下蹲下沉，返回新帧与参考列表。
 
-    做两件事：
+    做三件事：
     1. ``root.y = span(t) - span_ref``：恢复 world 模式被髋原点抹掉的竖直位移；
     2. 可选地把支撑脚钉在平滑后的跨度上并用两骨 IK 重排膝（``lock_support_foot``），
-       让脚底高度在整段里恒定，而不是跟着关键点噪声上下跳。
+       让脚底高度在整段里恒定，而不是跟着关键点噪声上下跳；
+    3. 可选的把双脚水平基准点低通后反解成 ``root.x/z``（``anchor_horizontal``），
+       脚在水平面里固定在原地，髋绕脚晃动 —— 解决"原地站着脚却在地上漂"。
     """
     config = config or GroundContactConfig()
     if not config.enabled:
@@ -461,6 +778,11 @@ def anchor_feet_to_ground(
     references = _references_from_series(spans, config)
     if not references:
         return list(frames), []
+
+    valid_indexes: dict[int | None, list[int]] = {}
+    for frame in frames:
+        if frame.valid:
+            valid_indexes.setdefault(frame.track_id, []).append(frame.index)
 
     step_seconds = _frame_step_seconds(frames)
     smoothed: dict[int | None, dict[int, float]] = {}
@@ -480,12 +802,21 @@ def anchor_feet_to_ground(
                 }
             )
 
-    valid_indexes: dict[int | None, list[int]] = {}
-    for frame in frames:
-        if frame.valid:
-            valid_indexes.setdefault(frame.track_id, []).append(frame.index)
     for track_id, span_by_index in smoothed.items():
         smoothed[track_id] = _fill_missing(span_by_index, valid_indexes.get(track_id, []))
+
+    horizontal, horizontal_metrics = _horizontal_offsets(frames, config, valid_indexes)
+    for track_id, (before, after) in horizontal_metrics.items():
+        reference = references.get(track_id)
+        if reference is None:
+            continue
+        references[track_id] = reference.model_copy(
+            update={
+                "horizontal_locked": True,
+                "horizontal_drift_before_meters": round(before, 6),
+                "horizontal_drift_after_meters": round(after, 6),
+            }
+        )
 
     outputs: list[ConvertedFrame] = []
     for frame in frames:
@@ -496,8 +827,9 @@ def anchor_feet_to_ground(
             continue
 
         delta = round(span - reference.foot_span_meters, 6)
+        offset_x, offset_z = horizontal.get(frame.track_id, {}).get(frame.index, (0.0, 0.0))
         update: dict[str, object] = {
-            "root": Vector3(x=0.0, y=delta, z=0.0),
+            "root": Vector3(x=round(offset_x, 6), y=delta, z=round(offset_z, 6)),
             # 预览用：髋到脚底的高度（已平滑），直接把髋放到地面上，
             # 不要再自己取"当前帧最低脚"，否则会把逐帧噪声又画一遍。
             "ground_span": round(span, 6),
@@ -521,7 +853,9 @@ __all__ = [
     "GroundReference",
     "anchor_feet_to_ground",
     "estimate_ground_references",
+    "foot_base_xz",
     "foot_span",
+    "side_foot_base",
     "side_foot_contact",
     "side_foot_span",
 ]

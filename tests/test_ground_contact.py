@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from app.backend.engine.base import LANDMARK_COUNT, Landmark, PoseFrame
@@ -237,3 +239,109 @@ def test_bundle_squat_restores_hip_descent_and_plants_feet() -> None:
     translations = [item.translation.y for item in bundle.root_motion.frames]
     assert min(translations) < -0.3
     assert any("着地锚定" in note for note in bundle.notes)
+    assert any("水平脚底" in note for note in bundle.notes)
+
+
+# --------------------------------------------------------------------------- #
+# 水平脚底锚定：原地站立时脚不能跟着髋在地面上漂
+# --------------------------------------------------------------------------- #
+
+
+def _standing_pair(
+    index: int,
+    sway: float,
+    left_jitter: float = 0.0,
+    right_jitter: float = 0.0,
+    lift: float = 0.0,
+) -> ConvertedFrame:
+    """原地站立（髋为原点）：身体左晃 sway 时，脚在髋局部坐标里反向移动 -sway。
+
+    ``lift`` 抬起左脚（span 变小），用来验证单脚离地不会把基准点拽走。
+    """
+    return ConvertedFrame(
+        index=index,
+        t=index / 30.0,
+        joints={
+            "left_foot_joint": JointPosition(
+                x=-0.10 - sway + left_jitter,
+                y=-0.85 + lift,
+                z=0.02 - sway,
+                visibility=0.95,
+            ),
+            "right_foot_joint": JointPosition(
+                x=0.10 - sway + right_jitter,
+                y=-0.85,
+                z=0.02 - sway,
+                visibility=0.95,
+            ),
+        },
+    )
+
+
+def _sway_frames(count: int = 61) -> list[ConvertedFrame]:
+    frames: list[ConvertedFrame] = []
+    for index in range(count):
+        seconds = index / 30.0
+        sway = 0.03 * math.sin(2.0 * math.pi * 0.4 * seconds)
+        jitter = 0.008 if index % 2 else -0.008
+        frames.append(_standing_pair(index, sway, jitter, -jitter))
+    return frames
+
+
+def test_horizontal_anchor_keeps_standing_feet_from_drifting() -> None:
+    """髋局部坐标下脚会跟着身体晃；水平锚定后脚在世界里基本不动，髋去晃。"""
+    frames = _sway_frames()
+    anchored, references = anchor_feet_to_ground(frames)
+
+    raw_foot_x = [frame.joints["left_foot_joint"].x for frame in frames]
+    foot_x = [frame.root.x + frame.joints["left_foot_joint"].x for frame in anchored]
+    # 锚定前左右各晃 ±3 cm（叠 ±0.8 cm 噪声）；锚定后脚只剩被低通滤掉的噪声。
+    assert max(raw_foot_x) - min(raw_foot_x) > 0.06
+    assert max(foot_x) - min(foot_x) < 0.02
+    # 髋必须真的在动，否则说明只是把整段位移清零了。
+    root_x = [frame.root.x for frame in anchored]
+    assert max(root_x) - min(root_x) > 0.05
+
+    reference = references[0]
+    assert reference.horizontal_locked
+    assert (
+        reference.horizontal_drift_after_meters
+        < reference.horizontal_drift_before_meters * 0.6
+    )
+
+
+def test_horizontal_anchor_can_be_disabled() -> None:
+    frames = _sway_frames(21)
+    anchored, references = anchor_feet_to_ground(
+        frames, GroundContactConfig(anchor_horizontal=False)
+    )
+    assert all(frame.root.x == 0.0 for frame in anchored)
+    assert not references[0].horizontal_locked
+
+
+def test_horizontal_anchor_ignores_lifted_foot() -> None:
+    """抬起一只脚时，基准点应跟着支撑脚走，而不是被抬起那只脚拽偏半个站距。"""
+    frames = [_standing_pair(index, 0.0, lift=0.25 if index >= 10 else 0.0) for index in range(31)]
+    anchored, _ = anchor_feet_to_ground(frames)
+    before = anchored[9].root.x
+    after = anchored[-1].root.x
+    assert abs(after - before) < 0.03
+
+
+def test_horizontal_anchor_skipped_when_only_one_foot_visible() -> None:
+    frames = []
+    for index in range(21):
+        frame = _standing_pair(index, 0.0)
+        frame.joints.pop("right_foot_joint")
+        frames.append(frame)
+    anchored, references = anchor_feet_to_ground(frames)
+    assert all(frame.root.x == 0.0 for frame in anchored)
+    assert not references[0].horizontal_locked
+
+
+def test_bundle_reports_horizontal_anchor_in_notes() -> None:
+    bundle = build_skeleton_bundle(
+        [_make_pose_frame(index) for index in range(5)], SkeletonConfig(include_optional=True)
+    )
+    assert any("水平脚底" in note for note in bundle.notes)
+    assert all(item.translation.x == pytest.approx(0.0, abs=1e-6) for item in bundle.root_motion.frames)

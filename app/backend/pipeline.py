@@ -356,7 +356,8 @@ def _analyze_once(
     def refine(image: np.ndarray, detected: list[PoseFrame]) -> None:
         if refiner is None:
             return
-        result: RefinementResult = refiner.infer(image)
+        # 传入本帧姿态：手部按腕点/肘点裁 ROI 再检测（远景全身视频整帧检不到手）。
+        result: RefinementResult = refiner.infer(image, detected)
         apply_refinements(detected, result)
 
     def forward(info: RuntimeProgress) -> None:
@@ -383,6 +384,7 @@ def _analyze_once(
         notes.extend(outcome.notes)
         if refiner is not None:
             notes.extend(refiner.notes)
+            notes.extend(refiner.stats_note())
     finally:
         if refiner is not None:
             refiner.close()
@@ -543,6 +545,15 @@ def summarize(result: AnalysisResult) -> dict[str, object]:
                 item.model_dump(mode="json") for item in result.postprocess.hands.sides
             ],
             "notes": result.postprocess.hands.notes,
+        },
+        # 直立基准：门控不满足时会静默跳过 —— 必须能读到。头相对躯干的前探不在这里，
+        # 它的深度由「头骨段解剖长度 + 鼻尖反推」决定（ik_fit.head_depth / mapping）。
+        "upright": {
+            "applied": result.postprocess.upright_baseline.applied,
+            "baselineMeters": result.postprocess.upright_baseline.baseline_meters,
+            "eligibleFrames": result.postprocess.upright_baseline.eligible_frames,
+            "adjustedFrames": result.postprocess.upright_baseline.adjusted_frames,
+            "notes": result.postprocess.upright_baseline.notes,
         },
         "tracks": [item.model_dump(mode="json") for item in result.postprocess.tracks],
         "primaryTrackId": result.postprocess.primary_track_id,
