@@ -121,18 +121,18 @@
   - [x] 确认质检 notes 里能看到一致率与丢弃原因（`quality.py` 已把 `DepthSignReport.notes` 汇入）
   - 自检脚本：`python scripts/check_depth_sign_chain.py [--mode model]`（无视频无权重即可跑，四项判定全 PASS；
     合成样本实测 `flips 33 → 0`，`--mode model` 无权重时如实打印「未找到 videopose3d 权重…本次退回时序一致性模式」）
-- [ ] 2.2 导出并校验 VideoPose3D ONNX 权重
-  - [ ] `python scripts/export_videopose3d_onnx.py --repo ../VideoPose3D --checkpoint ... --output models/videopose3d-h36m.onnx`（脚本已存在，`--verify` 不依赖 torch；**待本机下载非商业权重**）
-  - [ ] `python scripts/export_videopose3d_onnx.py --verify models/videopose3d-h36m.onnx` 通过（缺文件时脚本会明确报「找不到模型」，不会静默通过）
-  - [ ] 记录产物体积与 EP（预期 +40~60 MB）。EP 候选**已统一到一处**：`engine/acceleration.py::onnx_execution_providers()`，`depth_sign.py` 与 `bench_depth.py` 都调它，不再各写一份
-- [ ] 2.3 跑 `model` 后端并读自校准结论
-  - [ ] `DETECT_BODY_DEPTH_SIGN_MODE=model` 后重跑 `BM-05`
-  - [ ] 读 `DepthSignReport.notes`：一致率 >55% = 自校准通过；0.3~0.55 = 判定无效（说明该权重在此素材上无用，停止调参）；<0.3 = 判定深度轴镜像并已整体取反（阈值已在 `_calibrate_model_signs()` 实现，无需重新设计）
-  - [ ] 若判定无效，把结论写进 `docs/benchmark.md`，**不要**继续在这条路上堆参数，并直接归档 §3
+- [x] 2.2 导出并校验 VideoPose3D ONNX 权重
+  - [x] `python scripts/export_videopose3d_onnx.py --download-checkpoint` 拉官方权重（64.7 MB，非商业），再 `--repo ../VideoPose3D --output models/videopose3d-h36m.onnx` 导出
+  - [x] `--verify` 通过，且**换两个长度**（T=243/64）都得到 `[T,17,3]`：官方模型是 valid 卷积，导出时必须把"两侧边缘填充 + 裁回原长"烘进图里，否则 `[1,243,17,2]` 只会吐出 1 帧；`dynamic_axes` 也要标轴 1（T），标成轴 0 会得到"时间轴冻在首维"的废图
+  - [x] 记录产物体积与 EP：**64.6 MB 单文件**（不是外部 data），EP 实测 `CPUExecutionProvider`。EP 候选**已统一到一处**：`engine/acceleration.py::onnx_execution_providers()`
+- [x] 2.3 跑 `model` 后端并读自校准结论
+  - [x] 真实素材（`resources/demo.mp4` 前 300 帧）跑 `mode=model`：`lifter=videopose3d`、覆盖 200 帧 / 1594 骨段、耗时 123 ms
+  - [x] 读 `DepthSignReport.notes`：一致率 **0.852 → 自校准通过**（>0.55）；符号翻转 42 → 13（相对无先验基线 −79%），重投影 12.39 → 9.48 px，角度漂移 1.91 → 1.62°
+  - [x] 代价已量化并写进 `docs/benchmark.md`：z 抖动 0.0033 → 0.0079 m（带符号先验的骨段被排除在一阶时域项之外换来的方向正确性），因此 `depth_sign` 仍是**可选项**、不设默认；`mode` 默认改为 `auto`（有权重用 model、无权重退回 temporal）
 - [x] 2.4 前端不再硬编码后端
-  - [x] `app/frontend/src/components/AnalysisPanel.tsx` 的 `mode: 'temporal'` 改为可选项（`temporal` / `model`），并在权重缺失时置灰
+  - [x] `app/frontend/src/components/AnalysisPanel.tsx` 的 `mode: 'temporal'` 改为可选项（`auto` / `temporal` / `model`，默认 `auto`），并在权重缺失时置灰
   - [x] `app/frontend/src/api/analysis.ts::DepthSignOptions` 补 `model_path`、`auto_calibrate`、`swap_left_right`（后端 `DepthSignConfig` 已有这三个字段，纯 DTO 补齐）
-  - [x] 界面显示**当前实际使用的**后端：必须读后端回传的 `depthSign.mode`，**不要在前端推断**——`app/backend/pipeline.py` 中有合并规则：前端传的 `mode` 若等于默认值 `temporal`，会被 `settings.depth_sign_mode` 覆盖，前端自己算会显示错
+  - [x] 界面显示**当前实际使用的**后端：必须读后端回传的 `depthSign.mode`，**不要在前端推断**——`app/backend/pipeline.py` 中有合并规则：前端传的 `mode` 若仍是默认值（现为 `auto`），会被 `settings.depth_sign_mode` 解析后覆盖，前端自己算会显示错
   - [x] 降级时显示原因（如"权重缺失，已退回 temporal"），文案直接取 `depthSign.notes`，不要在前端另写一套判断
   - 置灰依据来自 `/api/models` 新增的 `lifters[]`（`present` + `filename`），不是前端猜文件名
 

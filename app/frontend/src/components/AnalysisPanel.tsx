@@ -30,6 +30,7 @@ const CALIBRATION_LABEL: Record<string, string> = {
 function backendLabel(mode: string | undefined, lifter?: string): string {
   if (!mode || mode === 'off') return '关闭'
   if (mode === 'model') return `抬升模型${lifter ? `（${lifter}）` : ''}`
+  if (mode === 'auto') return '自动（无抬升器权重，已用时序一致性）'
   return '时序一致性（temporal）'
 }
 
@@ -317,8 +318,9 @@ export function AnalysisPanel({ video, analysis, disabled, onStart, models }: An
   const [ikFit, setIkFit] = useState(true)
   // 深度方向修正默认关闭：它需要"时序证据"（≥30 帧）且会改变既有输出，属于可选项
   const [depthSign, setDepthSign] = useState(false)
-  // §2.4：后端可选；缺权重时 model 置灰（否则勾了也只会静默退回 temporal）
-  const [depthSignMode, setDepthSignMode] = useState<'temporal' | 'model'>('temporal')
+  // §2.4：后端可选。auto = 权重在就用抬升器、不在就退回时序一致性（后端解析，前端不猜）
+  const [depthSignMode, setDepthSignMode] =
+    useState<'auto' | 'temporal' | 'model'>('auto')
   // §5.1：检测阈值留空 = 用服务级配置；下肢重跑默认跟随服务级
   const [minDetection, setMinDetection] = useState('')
   const [minTracking, setMinTracking] = useState('')
@@ -328,7 +330,9 @@ export function AnalysisPanel({ video, analysis, disabled, onStart, models }: An
   const lifters: LifterInfo[] = models?.payload?.lifters ?? []
   const readyLifter = lifters.find((item) => item.present)
   const modelBackendReady = readyLifter !== undefined
-  const activeMode = depthSign && depthSignMode === 'model' && modelBackendReady ? 'model' : 'temporal'
+  // 显式选了 model 但权重缺失时交给后端 auto 解析（后端会退回 temporal 并写 note），
+  // 避免前端在这里"假装"选了另一个后端。
+  const activeMode = depthSignMode === 'model' && !modelBackendReady ? 'auto' : depthSignMode
 
   const running = analysis.phase === 'queued' || analysis.phase === 'running'
   const selection = analysis.status?.selection
@@ -546,14 +550,17 @@ export function AnalysisPanel({ video, analysis, disabled, onStart, models }: An
               <select
                 className="field"
                 value={depthSignMode}
-                onChange={(event) => setDepthSignMode(event.target.value as 'temporal' | 'model')}
+                onChange={(event) =>
+                  setDepthSignMode(event.target.value as 'auto' | 'temporal' | 'model')
+                }
                 disabled={running || !depthSign || !fitAvailable}
                 title={
                   modelBackendReady
-                    ? 'temporal：用整段动作的时序一致性定方向（零依赖）。model：用 ONNX 抬升器判方向，只取符号'
-                    : '抬升模型权重未就绪：把 videopose3d-h36m.onnx / motionbert-h36m.onnx 放到 models/ 后才会启用'
+                    ? 'auto：有权重用抬升器、没权重退回时序一致性。temporal：零依赖。model：用 ONNX 抬升器（VideoPose3D / MotionBERT）判方向，只取符号'
+                    : '抬升模型权重未就绪：把 videopose3d-h36m.onnx / motionbert-h36m.onnx 放到 models/ 后才会启用（auto 会自动退回时序一致性）'
                 }
               >
+                <option value="auto">自动（有抬升器权重就用）</option>
                 <option value="temporal">时序一致性（temporal）</option>
                 <option value="model" disabled={!modelBackendReady}>
                   {modelBackendReady

@@ -30,7 +30,7 @@ from app.backend.media.probe import VideoProbe, probe_video
 from app.backend.media.sampling import AnalysisPlan, SamplingConfig, build_analysis_plan
 from app.backend.perf.config import RuntimeConfig
 from app.backend.perf.runner import RuntimeProgress, run_inference
-from app.backend.postprocess.depth_sign import DepthSignConfig
+from app.backend.postprocess.depth_sign import DepthSignConfig, resolve_depth_sign_mode
 from app.backend.postprocess.ik_fit import FitConfig
 from app.backend.postprocess.pipeline import (
     PostProcessConfig,
@@ -454,7 +454,9 @@ def _analyze_once(
     if settings.depth_sign_enabled and not depth_sign_config.enabled:
         depth_sign_config = depth_sign_config.model_copy(update={"enabled": True})
     if depth_sign_config.mode == DepthSignConfig().mode:
-        depth_sign_config = depth_sign_config.model_copy(update={"mode": settings.depth_sign_mode})
+        depth_sign_config = depth_sign_config.model_copy(
+            update={"mode": resolve_depth_sign_mode(settings.depth_sign_mode, depth_sign_config)}
+        )
     post_updates["depth_sign"] = depth_sign_config
     post_config = options.postprocess.model_copy(update=post_updates)
     postprocess = run_postprocess(

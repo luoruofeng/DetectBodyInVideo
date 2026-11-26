@@ -130,10 +130,11 @@ class DepthSignConfig(BaseModel):
     """深度符号先验的参数。默认关闭：关闭时输出与改动前逐位一致。"""
 
     enabled: bool = Field(False, description="总开关；关闭后不产生任何符号，ik_fit 行为不变")
-    mode: Literal["temporal", "model"] = Field(
-        "temporal",
+    mode: Literal["auto", "temporal", "model"] = Field(
+        "auto",
         description="temporal = 用 world z 做时序一致性（零依赖）；"
-        "model = 用 ONNX 抬升器判方向（需下载权重，缺失自动退回 temporal）",
+        "model = 用 ONNX 抬升器判方向（需下载权重，缺失自动退回 temporal）；"
+        "auto = 权重在就用 model、不在就 temporal",
     )
     model_path: str | None = Field(None, description=f"抬升模型路径；留空自动搜 models/{ONNX_MODEL_FILENAME}")
     window: int = Field(9, ge=1, le=121, description="多数投票的时间窗（样本数，不是帧数）")
@@ -508,6 +509,20 @@ def resolve_model_path(config: DepthSignConfig, lifter: str | None = None) -> st
     return None
 
 
+def resolve_depth_sign_mode(
+    configured: str, config: DepthSignConfig | None = None
+) -> str:
+    """把服务级配置解析成实际后端名。
+
+    ``auto``（默认）表示"权重在就用抬升器，不在就用零依赖的时序一致性" ——
+    也就是 VideoPose3D 这类模型**装了才生效**，不会因为缺文件而报错，也不会
+    让没有权重的机器多付一次未命中查找之外的成本。
+    """
+    if configured != "auto":
+        return configured
+    return "model" if resolve_model_path(config or DepthSignConfig()) else "temporal"
+
+
 def lifter_catalog(config: DepthSignConfig | None = None) -> list[dict[str, object]]:
     """可选的抬升器与权重就绪情况（供 UI 把 ``model`` 档置灰）。"""
     config = config or DepthSignConfig()
@@ -791,6 +806,12 @@ def estimate_depth_signs(
 ) -> tuple[SignMap, DepthSignReport]:
     """生成 ``{帧号: {骨段: (符号, 置信度)}}``。任何异常都退回"不给符号"，绝不中断分析。"""
     config = config or DepthSignConfig()
+    # ``auto`` 在入口处解析成实际后端：直接调用本函数的地方（基准脚本 / 单测）
+    # 不必关心"有没有权重"这件事，与 ``pipeline`` 走同一套规则。
+    if config.mode == "auto":
+        config = config.model_copy(
+            update={"mode": resolve_depth_sign_mode("auto", config)}
+        )
     report = DepthSignReport(mode=config.mode if config.enabled else "off")
     report.swing_leg = swing_leg or "none"
     ordered = sorted(frames, key=lambda item: item.index)
@@ -970,6 +991,7 @@ __all__ = [
     "build_lifter_backend",
     "estimate_depth_signs",
     "lifter_catalog",
+    "resolve_depth_sign_mode",
     "resolve_lifter_name",
     "resolve_model_path",
 ]

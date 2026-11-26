@@ -166,6 +166,24 @@ class FitConfig(BaseModel):
         "对它们做时域平滑只会把结果往上一帧拽、牺牲 2D 一致性（实测 0 → 2 cm 漂移）；"
         "深度没有观测，才需要时域先验。改回 'xyz' 可复现改动前的行为",
     )
+    acceleration_weight: float = Field(
+        0.0,
+        ge=0,
+        le=5,
+        description="二阶（加速度）时域约束权重：罚 "
+        "``z(t) − 2z(t−1) + z(t−2)``，只作用在深度轴。"
+        "一阶项（``temporal_weight``）罚的是速度，匀速平移会被当成误差压掉、还引入滞后；"
+        "抖动本身就是二阶差分，所以这一项是**直接对着'动作不顺滑'写的**："
+        "匀速/匀加速段残差为 0（不拖慢动作），只有逐帧来回抖才被罚。"
+        "0 = 关闭（与改动前逐位一致）",
+    )
+    acceleration_max_gap_frames: int = Field(
+        2,
+        ge=1,
+        le=30,
+        description="上一帧与本帧帧号间隔超过该值时不施加加速度约束："
+        "中间隔着补帧/长缺口时，二三阶差分会被缺口放大成假加速度",
+    )
     root_prior_weight: float = Field(0.2, ge=0, le=5, description="根平移先验权重（压住深度漂移）")
     depth_prior_weight: float = Field(
         0.5,
@@ -899,6 +917,9 @@ class _FrameContext:
         "obs_v",
         "parent",
         "prev",
+        "prev2",
+        "accel_scale",
+        "accel_rows",
         "reproj_idx",
         "root_scale",
         "scale",
@@ -1167,6 +1188,7 @@ def _make_context(
     yaw_prior: tuple[float, float] | None,
     held: Mapping[int, tuple[np.ndarray, float]] | None = None,
     signs: Mapping[str, tuple[int, float]] | None = None,
+    previous2: np.ndarray | None = None,
 ) -> _FrameContext:
     keys = [node.key for node in NODES]
     index_of = {key: i for i, key in enumerate(keys)}
@@ -1359,6 +1381,12 @@ def _make_context(
     context.obs_v = np.asarray(obs_v, dtype=np.float64)
     context.weights = np.asarray(weights, dtype=np.float64)
     context.prev = previous
+    context.prev2 = previous2
+    # 加速度项**不排除**有符号/方向先验的骨段：一阶项排除它们的理由是"匀速运动被
+    # 压成不动 → 动作慢半拍"，而二阶项对匀速段残差恒为 0，只在速度突变时起作用，
+    # 正好是符号翻转那一刻需要的阻尼，不会拖慢动作。
+    context.accel_rows = np.arange(len(NODES), dtype=np.int64)
+    context.accel_scale = math.sqrt(config.acceleration_weight)
     context.temporal_scale = math.sqrt(config.temporal_weight)
     context.root_scale = math.sqrt(config.root_prior_weight)
     context.yaw = yaw
@@ -1460,6 +1488,24 @@ def _build_sparsity(context: _FrameContext, config: FitConfig) -> np.ndarray:
             for offset, node in enumerate(context.temporal_rows):
                 rows.append((cursor + offset, columns_for(int(node))))
             cursor += int(context.temporal_rows.size)
+        else:
+            for node in range(node_count):
+                cols = columns_for(node)
+                for axis in range(3):
+                    rows.append((cursor + node * 3 + axis, cols))
+            cursor += node_count * 3
+
+    # 加速度项与一阶项结构相同：只依赖**本帧**参数（prev/prev2 是常量），
+    # 所以稀疏块与 residual 行数一一对应即可，雅可比不会退化成稠密。
+    if (
+        context.prev is not None
+        and context.prev2 is not None
+        and context.accel_scale > 0
+    ):
+        if config.temporal_axes == "z":
+            for offset, node in enumerate(context.accel_rows):
+                rows.append((cursor + offset, columns_for(int(node))))
+            cursor += int(context.accel_rows.size)
         else:
             for node in range(node_count):
                 cols = columns_for(node)
@@ -1602,6 +1648,21 @@ def _residuals(params: np.ndarray, context: _FrameContext, config: FitConfig) ->
         else:
             parts.append(delta.ravel() * context.temporal_scale)
 
+    # 二阶（加速度）约束：`z(t) − 2z(t−1) + z(t−2)`。
+    # 与一阶项的区别是"匀速运动不罚"：一阶项会把正常平移也按误差压掉（引入滞后），
+    # 二阶项只在速度突变处起作用，正好对应播放时的"抖 / 顿"。
+    if (
+        context.prev is not None
+        and context.prev2 is not None
+        and context.accel_scale > 0
+    ):
+        accel = positions - 2.0 * context.prev + context.prev2
+        if config.temporal_axes == "z":
+            if context.accel_rows.size:
+                parts.append(accel[context.accel_rows, 2] * context.accel_scale)
+        else:
+            parts.append(accel.ravel() * context.accel_scale)
+
     if context.root_scale > 0:
         parts.append(params[:ROOT_PARAMS] * context.root_scale)
 
@@ -1661,6 +1722,8 @@ class FrameFitter:
         self.config = config or FitConfig()
         self.lengths = lengths
         self._previous: np.ndarray | None = None
+        self._previous2: np.ndarray | None = None
+        self._previous_index: int | None = None
         keys = [node.key for node in NODES]
         index_of = {key: i for i, key in enumerate(keys)}
         self._parent = np.array(
@@ -1670,6 +1733,12 @@ class FrameFitter:
         self._last_dirs: np.ndarray | None = None
         self._last_parent_dirs: np.ndarray | None = None
         self._hold_age = [0] * len(NODES)
+
+    def _remember(self, fitted: np.ndarray, index: int) -> None:
+        """记录本帧结果，供下一帧的一阶/二阶时域项使用。"""
+        self._previous2 = self._previous
+        self._previous = fitted
+        self._previous_index = int(index)
 
     def _update_occlusion_state(self, array: np.ndarray, occluded: Sequence[bool]) -> None:
         """更新"上次可信方向"与连续遮挡帧数；被保持的关节不覆盖参考姿态。"""
@@ -1780,6 +1849,15 @@ class FrameFitter:
             )
         report.held_joints = [NODES[index].key for index in sorted(held)]
 
+        # 加速度项需要 t−2：中间隔着长缺口（跳帧 / 补帧）时二三阶差分会被放大成假加速度，
+        # 所以帧号间隔超过阈值就整帧不用这一项，而不是把缺口当运动。
+        previous2 = self._previous2
+        if (
+            previous2 is not None
+            and self._previous_index is not None
+            and frame.index - self._previous_index > config.acceleration_max_gap_frames
+        ):
+            previous2 = None
         context = _make_context(
             frame,
             positions,
@@ -1790,6 +1868,7 @@ class FrameFitter:
             yaw,
             held=held,
             signs=signs,
+            previous2=previous2,
         )
         if context.scale <= 1e-9:
             return self._fallback(
@@ -1811,7 +1890,7 @@ class FrameFitter:
             report.reproj_error_norm = round(reproj, 6)
             report.bone_length_error_pct = round(bone, 4)
             report.note = "未安装 scipy，仅做骨长钳制（不做最小二乘拟合）"
-            self._previous = fitted
+            self._remember(fitted, frame.index)
             self._update_occlusion_state(fitted, occluded)
             return _write_back(frame, fitted), report
         try:
@@ -1862,7 +1941,7 @@ class FrameFitter:
             )
 
         report.fitted = True
-        self._previous = fitted
+        self._remember(fitted, frame.index)
         self._update_occlusion_state(fitted, occluded)
         return _write_back(frame, fitted), report
 

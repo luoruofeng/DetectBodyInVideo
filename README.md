@@ -237,7 +237,7 @@ export DETECT_BODY_MODEL_MIRROR_URL=https://your-mirror.example.com/mediapipe-mo
 | 断点续算 | 开启 | 同时设置 `checkpoint=true` 与 `resume=true` |
 | 骨长约束拟合 | 开启 | 仅在所选引擎能输出米制 world landmarks 时生效；ONNX 引擎会置灰并关闭 |
 | 深度方向修正 | 关闭 | 单目下每根骨段只剩「往前还是往后」一个比特；开启后用整段动作的时序一致性把它定住（前踢腿不再被解成后踢腿）。需要 ≥30 帧，只在符号反了时纠正，不动 2D 与骨长 |
-| 深度方向后端 | `temporal` | 勾选「深度方向修正」后可选：`temporal`（零依赖，默认）/ `model`（ONNX 抬升器）。`model` 在 `models/` 里没有对应权重时**置灰不可选**；运行中若权重缺失或自校准判定无效，会退回 `temporal`，并在质检卡片上显示实际后端与原因 |
+| 深度方向后端 | `auto` | 勾选「深度方向修正」后可选：`auto`（默认，有抬升器权重就用 `model`、没有就 `temporal`）/ `temporal`（零依赖）/ `model`（ONNX 抬升器）。`model` 在 `models/` 里没有对应权重时**置灰不可选**；运行中若权重缺失或自校准判定无效，会退回 `temporal`，并在质检卡片上显示实际后端与原因 |
 | 下肢检测阈值 | 空（用服务级 0.5） | `min_detection_confidence` / `min_tracking_confidence`；下肢在画面里只占十几行像素时，默认 0.5 会把腿判成"没看见"，深度只能靠躯干外推 |
 | 下肢重跑 | 跟随服务级（开启） | 下肢平均可见度低于 0.5 且坏帧占比 >35% 时，用 `heavy` 档模型重跑整段；摘要里的 `retryReason` 会写明为什么跑了两遍 |
 
@@ -862,7 +862,7 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 | `DETECT_BODY_IK_FIT_FOV_DEGREES` | `60.0` | 相机水平视场角，10–150 度 |
 | `DETECT_BODY_Z_SMOOTHING_SCALE` | `0.3` | Z 轴 min_cutoff 相对 x/y 的系数 |
 | `DETECT_BODY_DEPTH_SIGN_ENABLED` | `false` | 置 `1` 时全局启用深度方向修正（即使界面开关未勾选） |
-| `DETECT_BODY_DEPTH_SIGN_MODE` | `temporal` | 后端：`temporal` 用世界坐标 z 做时序一致性（零新增依赖）/ `model` 用 ONNX 抬升器判方向（权重缺失自动退回 `temporal`，`summary.depthSign.mode` 会如实回传实际后端） |
+| `DETECT_BODY_DEPTH_SIGN_MODE` | `auto` | 后端：`auto` 有权重用 `model`、没权重退回 `temporal`；`temporal` 用世界坐标 z 做时序一致性（零新增依赖）/ `model` 用 ONNX 抬升器判方向（权重缺失自动退回 `temporal`，`summary.depthSign.mode` 会如实回传实际后端） |
 | `DETECT_BODY_LIFTER` | `videopose3d` | `model` 后端用哪个抬升器：`videopose3d` / `motionbert` / `agformer`，决定搜 `models/videopose3d-h36m.onnx` 还是 `motionbert-h36m.onnx` 等；三者契约相同（`[T,17,2] → [T,17,3]`），只用 Δz 符号 |
 | `DETECT_BODY_LOWER_BODY_REFINE` | `false` | MediaPipe 专用：下肢可见度低时把下半身裁出来再推理一次（ROI 重解），坏帧会多付一次推理 |
 | `DETECT_BODY_LOWER_LIMB_RETRY` | `true` | 下肢可见度不足时是否用更高档位模型重跑整段（只重跑一遍，不循环） |
@@ -889,13 +889,13 @@ DETECT_BODY_ONNX_POSE_MODEL=D:/models/rtmpose-m_256x192.onnx
 关键嵌套默认值：
 
 - `postprocess`：`estimate_orientation=true`、`compute_angles=true`、`fps=30.0`、`stride=1`、`target_track_id=null`。
-- 平滑：`method=one-euro`、`window=5`、`polyorder=2`、`extra_world_pass=true`；归一化点 x/y 的 One Euro 为 `1.0/0.5/1.0`，z 为 `0.3/0.15/1.0`；世界点另有独立一组 `1.0/1.0/1.0`，z 为 `0.3/0.3/1.0`（米制量级不同，不能共用参数）。
+- 平滑：`method=one-euro`、`window=5`、`polyorder=2`、`extra_world_pass=true`、`zero_phase_world=true`；归一化点 x/y 的 One Euro 为 `1.0/0.5/1.0`，z 为 `0.3/0.15/1.0`；世界点另有独立一组 `1.0/1.0/1.0`，z 为 `0.3/0.3/1.0`（米制量级不同，不能共用参数）。`zero_phase_world` 让世界点那一趟做**前向+后向**（零相位）滤波：单向 One Euro 是因果滤波，必然滞后且压抖有限；整段离线分析没有实时性约束，倒序再滤一遍可把相位延迟抵消，实测 z 抖动 −35%、角度漂移 −15%、重投影不变（见 `docs/benchmark.md`「零相位世界点平滑」）。置 `false` 回到旧的单向行为。
 - 补帧：可见度阈值 0.5、至少 6 个点、`score>=0.4`、最多补 5 帧内部缺口；片头片尾与长缺口保持 `valid=false`。
 - 手部稳定（`hand_stability`）：手部 21 点默认开启掉帧补全、姿态迟滞与相对姿态平滑；可在 A/B 时整体关闭。
 - 角度：11 个名称（左右肘/肩/膝/髋 + `torso_lean` + 有符号 `torso_pitch_signed_deg`，后者正=向镜头前倾、负=后仰，导出校验对它放宽到 -180~180°；+ `head_lean`，见下），优先用 world 点，缺 33 点时回退归一化点，退化角由 `compute_angles()` 直接省略；导出的 `attach_angles()` 在短时遮挡时会沿用上一有效角度，默认最多保持 15 帧（`hold_occluded_frames`）。
 - `head_lean`：头在**矢状面**的倾角（0°=颅骨中心正落在肩中点上方），终点取 `mapping.head_reference_point()`——也就是 `head_joint` 的来源，口径与导出坐标一致。不含左右分量（横向歪头会把角度读成「前倾」，那是另一件事）。它是「头前倾」唯一可量化的读数：修完再跑，站立段应当稳定在个位数度数。
 - 直立基准校准（`upright_baseline`）：默认开启；开头 60 帧里至少 10 帧满足「yaw 宽度比 ≥0.92 + 髋中点帧间位移 ≤0.02」时，取上半身 `chest.z - pelvis.z` 中位数（绝对值上限 0.25 m）从全片上半身 world z 扣除，缓解正面站立被解出躯干前倾。门控不满足时自动跳过，`enabled=false` 整体关闭。**头相对躯干的前探不在这里修**：两耳的 z 不受任何约束（见下一条），扣一个常数既抹不平逐帧变化、又只在开头窗口有效。
-- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`、`root_prior_weight=0.2`、`depth_prior_weight=0.5`、`head_depth={enabled=true, prior_scale=0, flat_boost=2.0, flat_gate_power=0, flat_gate_floor=0.6, target_forward_meters=0.09}`、`aspect_ratio` 缺省 `9/16`、`refine_tolerance=0.01`、`bone_sample_min_projected_ratio=0.85`、`symmetrize_bones=true`、`max_left_right_asymmetry=0.08`，遮挡期还有 `occlusion_weight=1.5`、`occlusion_max_frames=30`、`occlusion_jump_degrees=75`、`max_reproj_error=0.05`；只改 world 点，不改 2D 关键点。
+- IK：`enabled=true`、`max_nfev=60`、`hard_bones=true`、`refine_passes=2`、`temporal_axes="z"`、`acceleration_weight=0`（二阶时域约束，默认关闭；实测在 300 帧真实素材上 z 抖动只降 4%、却让 xy 抖动升 8%，因此**不采纳为默认**，仅作为极端抖动素材的可选旋钮）、`max_yaw_deviation=25°`、`loss="soft_l1"`、`depth_flat_weight=1.5`、`depth_flat_gate_power=4`、`rigidify_failed_frames=true`、`max_reproj_increase=0.01`、`root_prior_weight=0.2`、`depth_prior_weight=0.5`、`head_depth={enabled=true, prior_scale=0, flat_boost=2.0, flat_gate_power=0, flat_gate_floor=0.6, target_forward_meters=0.09}`、`aspect_ratio` 缺省 `9/16`、`refine_tolerance=0.01`、`bone_sample_min_projected_ratio=0.85`、`symmetrize_bones=true`、`max_left_right_asymmetry=0.08`，遮挡期还有 `occlusion_weight=1.5`、`occlusion_max_frames=30`、`occlusion_jump_degrees=75`、`max_reproj_error=0.05`；只改 world 点，不改 2D 关键点。
   - `head_depth` 是**头部专项**，分三层（缺一层就修不好「正对镜头站立却明显头前倾」）：
     1. **骨长按解剖封顶**（`calibrate_bone_lengths`）：`head` 是「肩中点→鼻尖」，解剖长度 = `hypot(竖直跨度, HEAD_FORWARD_METERS)` ≈ 0.17~0.21 m；MediaPipe 的 world z 会把它量成 0.23~0.29 m（多出来的全是「脸朝镜头」的深度先验）。固定骨长 + 2D 投影下 `|Δz| = sqrt(L² − p²)`，多 5~10 cm 的 `L` 会**全部变成前探**，这是根因。封顶只往下压、不往上抬，侧视（深度真可观测）原样保留，并在 `fit.notes` 里报告被压掉了多少。
     2. **压平目标不是 0**（`target_forward_meters=0.09`）：解剖上颅骨中心（两耳中点）几乎正落在肩中点铅垂线上，鼻尖在它前方 9~10 cm。把 `Δz` 压到 0 等于让鼻尖退到肩中点正上方，`head_joint` 反而落到胸后方 9 cm（看起来是仰头/脖子后缩）。
@@ -1097,7 +1097,7 @@ pytest tests/test_export.py -q
 | `scripts/bench.py` | `python scripts/bench.py --engine stub --synthetic --batch 1,4` | 推理链路吞吐基准；`--engine` 可选 `stub` / `auto` / `mediapipe` / `onnx` |
 | `scripts/bench_depth.py` | `python scripts/bench_depth.py --synthetic --json out/depth.json` | 深度 / 几何质量基准：`z_jitter`、`bone_length_cv`、`reproj_error_px`、`angle_drift_deg`、`depth_sign_flips`、`sagittal_motion_share`；踢腿专项加 `--labels` 后输出 `sign_accuracy`、`kick_sagittal_error_*`、`kick_phase_max_frame_error` |
 | `scripts/bench_z_smoothing.py` | `python scripts/bench_z_smoothing.py --json out/z_params.json` | Z 轴 One Euro 参数 A/B |
-| `scripts/export_videopose3d_onnx.py` | `python scripts/export_videopose3d_onnx.py --verify models/videopose3d-h36m.onnx` | 把 VideoPose3D 离线导出为 ONNX（供 `DETECT_BODY_DEPTH_SIGN_MODE=model`），或校验已有权重 |
+| `scripts/export_videopose3d_onnx.py` | `python scripts/export_videopose3d_onnx.py --verify models/videopose3d-h36m.onnx` | 把 VideoPose3D 离线导出为 ONNX（供 `DETECT_BODY_DEPTH_SIGN_MODE=model`），或校验已有权重。`--download-checkpoint` 可一键拉官方权重（约 45 MB，H36M **仅限非商业研究**）；导出时把"两侧边缘填充 + 裁回原长"烘进图里，时间轴 T 动态，运行期可直接喂任意长度 |
 | `scripts/export_motionbert_onnx.py` | `python scripts/export_motionbert_onnx.py --verify models/motionbert-h36m.onnx` | 同上，导出 MotionBERT（DSTFormer），支持 `--mode dynamic/fixed` 两种 T 策略 |
 | `scripts/fuse_views.py` | `python scripts/fuse_views.py --front BM-05.mp4 --side BM-06.mp4 --out out/fused.json` | 双机位角度级融合（不三角化）：矢状面角度取侧视、额状面取正视，按动作相位对齐时间轴 |
 | `scripts/check_depth_sign_chain.py` | `python scripts/check_depth_sign_chain.py --mode model` | 深度方向修正链路自检（无视频/无权重也能跑）：阶段进度、`mode`、翻转次数、质检 notes 四项判定 |

@@ -189,7 +189,7 @@ def test_temporal_prior_removes_sporadic_flips():
             frame.world_landmarks[LEFT_KNEE].z = -frame.world_landmarks[LEFT_KNEE].z
 
     signs, report = depth_sign.estimate_depth_signs(
-        frames, DepthSignConfig(enabled=True), aspect=ASPECT
+        frames, DepthSignConfig(enabled=True, mode="temporal"), aspect=ASPECT
     )
     assert report.applied is True
     assert report.flips_before > 0
@@ -203,7 +203,7 @@ def test_temporal_prior_removes_sporadic_flips():
 def test_depth_sign_requires_enough_frames():
     frames = _kick_frames(12)
     signs, report = depth_sign.estimate_depth_signs(
-        frames, DepthSignConfig(enabled=True), aspect=ASPECT
+        frames, DepthSignConfig(enabled=True, mode="temporal"), aspect=ASPECT
     )
     assert signs == {}
     assert report.applied is False
@@ -215,7 +215,7 @@ def test_depth_sign_without_world_landmarks():
     for frame in frames:
         frame.world_landmarks = []
     signs, report = depth_sign.estimate_depth_signs(
-        frames, DepthSignConfig(enabled=True), aspect=ASPECT
+        frames, DepthSignConfig(enabled=True, mode="temporal"), aspect=ASPECT
     )
     assert signs == {}
     assert report.applied is False
@@ -227,6 +227,28 @@ def test_disabled_config_produces_nothing():
     assert signs == {}
     assert report.mode == "off"
     assert report.applied is False
+
+
+def test_auto_mode_resolves_to_temporal_without_weights(monkeypatch):
+    """``auto`` = 权重在就 model、不在就 temporal；默认档位因此对谁都安全。"""
+    frames = _kick_frames(40)
+    monkeypatch.setattr(depth_sign, "resolve_model_path", lambda config, lifter=None: None)
+    signs, report = depth_sign.estimate_depth_signs(
+        frames, DepthSignConfig(enabled=True), aspect=ASPECT
+    )
+    assert report.applied is True
+    assert report.mode == "temporal"
+    assert signs
+
+
+def test_auto_mode_resolves_to_model_when_weights_exist(monkeypatch):
+    monkeypatch.setattr(
+        depth_sign, "resolve_model_path", lambda config, lifter=None: "models/fake.onnx"
+    )
+    assert depth_sign.resolve_depth_sign_mode("auto") == "model"
+    # 显式指定时不看权重
+    assert depth_sign.resolve_depth_sign_mode("temporal") == "temporal"
+    assert depth_sign.resolve_depth_sign_mode("model") == "model"
 
 
 def test_model_mode_without_weights_falls_back_to_temporal(monkeypatch):
@@ -326,7 +348,9 @@ def test_lift_stage_progress_and_quality_notes():
     frames = _mirror_leg_depth(_kick_frames(40, peak_deg=70.0))
     stages: list[tuple[str, str]] = []
     config = PostProcessConfig(
-        fps=30.0, aspect_ratio=ASPECT, depth_sign=DepthSignConfig(enabled=True)
+        fps=30.0,
+        aspect_ratio=ASPECT,
+        depth_sign=DepthSignConfig(enabled=True, mode="temporal"),
     )
     result = run_postprocess(
         frames,
@@ -342,7 +366,9 @@ def test_lift_stage_progress_and_quality_notes():
 def test_postprocess_reports_lift_stage():
     frames = _mirror_leg_depth(_kick_frames(40, peak_deg=70.0))
     config = PostProcessConfig(
-        fps=30.0, aspect_ratio=ASPECT, depth_sign=DepthSignConfig(enabled=True)
+        fps=30.0,
+        aspect_ratio=ASPECT,
+        depth_sign=DepthSignConfig(enabled=True, mode="temporal"),
     )
     result = run_postprocess(frames, config)
     assert result.depth_sign.applied is True

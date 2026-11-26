@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-
 import synth_pose
+
 from app.backend.engine.base import LANDMARK_COUNT, Landmark, PoseFrame
 from app.backend.postprocess.one_euro import (
     OneEuroFilter1D,
@@ -20,6 +20,7 @@ from app.backend.postprocess.one_euro import (
     default_one_euro_params,
     default_world_one_euro_params,
     smooth_array,
+    smooth_array_zero_phase,
 )
 from app.backend.postprocess.pipeline import (
     PostProcessConfig,
@@ -185,6 +186,56 @@ def test_legacy_pipeline_has_no_world_pass_and_no_yaw() -> None:
     assert result.yaw == []
     assert not any(key.startswith("world") for key in result.smoothing.params)
     assert not any("world_landmarks" in note for note in result.smoothing.notes)
+
+
+def test_zero_phase_world_pass_is_default_and_reported() -> None:
+    """零相位是默认档，且要能在 ``quality.smoothing`` 里看到（可复现、可回滚）。"""
+    assert SmoothingConfig().zero_phase_world is True
+    frames = synth_pose.add_depth_noise(synth_pose.make_frames(24), z_sigma=0.02)
+    result = run_postprocess(
+        frames,
+        PostProcessConfig(
+            ik_fit=PostProcessConfig().ik_fit.model_copy(update={"enabled": False})
+        ),
+    )
+    assert result.smoothing.params.get("worldZeroPhase") is True
+
+
+def test_zero_phase_cuts_more_jitter_than_causal() -> None:
+    """前向+后向应当比单向压得更狠（同一组参数、同一段噪声）。"""
+    frames = synth_pose.add_depth_noise(synth_pose.make_frames(40), z_sigma=0.02, xy_sigma=0.006)
+    causal = smooth_frames(frames, SmoothingConfig(), use_world=True, zero_phase=False)[0]
+    zero_phase = smooth_frames(frames, SmoothingConfig(), use_world=True, zero_phase=True)[0]
+
+    z_causal = _adjacent_rms(causal, (2,))
+    z_zero = _adjacent_rms(zero_phase, (2,))
+    assert z_zero < z_causal, f"零相位应更平滑（{z_causal:.5f} → {z_zero:.5f}）"
+
+
+def test_zero_phase_does_not_lag_a_constant_velocity_ramp() -> None:
+    """单向滤波必然滞后；零相位在匀速段应当把位置还原回来（误差更小）。"""
+    count = 40
+    array = np.zeros((count, LANDMARK_COUNT, 4), dtype=np.float32)
+    array[:, :, 3] = 0.95
+    ramp = np.linspace(0.0, 0.5, count, dtype=np.float32)
+    array[:, :, 0] = ramp[:, None]
+    stamps = [index * 33.0 for index in range(count)]
+
+    interior = slice(10, count - 10)
+    causal = smooth_array(array, stamps, default_world_one_euro_params())[interior, 0, 0]
+    zero = smooth_array_zero_phase(array, stamps, default_world_one_euro_params())[interior, 0, 0]
+    truth = ramp[interior]
+
+    causal_error = float(np.mean(np.abs(causal - truth)))
+    zero_error = float(np.mean(np.abs(zero - truth)))
+    assert zero_error < causal_error, f"零相位不该滞后（{causal_error:.5f} vs {zero_error:.5f}）"
+
+
+def test_acceleration_prior_is_off_by_default() -> None:
+    """二阶项默认 0：关掉时输出与改动前逐位一致（只作为可选旋钮）。"""
+    from app.backend.postprocess.ik_fit import FitConfig
+
+    assert FitConfig().acceleration_weight == 0.0
 
 
 def test_landmark_helper_keeps_visibility() -> None:

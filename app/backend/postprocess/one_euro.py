@@ -219,6 +219,28 @@ def smooth_array(
     return result
 
 
+def smooth_array_zero_phase(
+    array: np.ndarray, timestamps_ms: Sequence[float], params: OneEuroParams | None = None
+) -> np.ndarray:
+    """前向 + 后向 One-Euro（零相位近似）。
+
+    单向 One-Euro 是**因果**滤波：输出必然滞后输入，且"压抖"与"跟手"只能二选一。
+    把序列倒过来再滤一遍，两次的相位延迟互相抵消，同一组参数能再压低一截抖动，
+    而快速动作的峰值位置不会被推移（``angle_drift`` / 峰值时刻不变）。
+
+    代价是**非因果**：必须拿到整段序列才能算，不适合逐帧实时预览；
+    本项目是"整段视频离线分析"，正好不冲突。
+    """
+    params = params or default_one_euro_params()
+    data = np.asarray(array, dtype=np.float32)
+    if data.shape[0] < 3:
+        return data.copy()
+    forward = smooth_array(data, timestamps_ms, params)
+    stamps = [float(stamp) for stamp in timestamps_ms]
+    backward = smooth_array(forward[::-1].copy(), list(reversed(stamps)), params)
+    return np.ascontiguousarray(backward[::-1])
+
+
 def smooth_frames(
     frames: Sequence[PoseFrame],
     params: OneEuroParams | None = None,

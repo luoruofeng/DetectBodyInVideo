@@ -147,6 +147,51 @@ python scripts/bench_z_smoothing.py --json out/z_params.json
 - 这三个值都是 `one_euro.Z_MIN_CUTOFF_SCALE` / `Z_BETA_SCALE` 派生的常量，改系数即可整体缩放。
 
 
+### 零相位世界点平滑 / 二阶时域约束（2026-11-25）
+
+背景：单向 One-Euro 是**因果**滤波，必然带滞后，且"压抖"与"跟手"只能二选一。
+本项目是整段离线分析，没有实时性约束，所以世界点那一趟可以倒序再滤一遍（零相位）。
+同时评估了"给 IK 加二阶（加速度）时域残差"这条更贵的路线，结论是**不采纳为默认**。
+
+素材：本工作区 `resources/demo.mp4` 的前 300 帧（1080×1188、30 fps，`resources/demo_clip.mp4`）。
+命令（`--accel-weight` / `--zero-phase` / `--no-zero-phase` 为本轮新增的 A/B 开关）：
+
+```powershell
+python scripts/bench_depth.py resources/demo_clip.mp4 --json out/base.json                       # 基线（单向）
+python scripts/bench_depth.py resources/demo_clip.mp4 --zero-phase --json out/zero_phase.json    # 零相位
+python scripts/bench_depth.py resources/demo_clip.mp4 --accel-weight 0.5 --json out/accel05.json # 二阶项
+python scripts/bench_depth.py resources/demo_clip.mp4 --depth-sign --json out/sign.json          # 符号先验
+python scripts/bench_depth.py resources/demo_clip.mp4 --zero-phase --depth-sign                  # 组合
+```
+
+| 配置 | z 抖动 (m) | xy 抖动 (m) | 重投影 (px) | 角度漂移 (°) | 骨长 CV max | 符号翻转 | yaw 抖动 (°) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 基线（单向 One-Euro） | 0.00499 | 0.01048 | 12.42 | 2.25 | 0.0472 | 62 | 16.0 |
+| **零相位（新默认）** | **0.00325** | **0.00869** | **12.39** | **1.91** | 0.0478 | **42** | **12.3** |
+| 二阶项 `acceleration_weight=0.5` | 0.00477 | 0.01134 | 12.45 | 2.37 | 0.0476 | 66 | 16.1 |
+| 二阶项 `acceleration_weight=1.5` | 0.00461 | 0.01172 | 12.45 | 2.54 | 0.0483 | 86 | 16.2 |
+| 深度符号 `temporal` | 0.01023 | 0.00937 | 6.95 | 1.95 | 0.0324 | 52 | 16.2 |
+| 零相位 + 符号 | 0.00762 | 0.00759 | 6.81 | 1.75 | 0.0326 | 33 | 12.4 |
+| 零相位 + 符号 `model`（VideoPose3D 真实权重） | 0.00793 | 0.00739 | 9.48 | 1.62 | 0.0334 | 13 | 12.5 |
+
+结论：
+
+- **零相位是全面收益**：z 抖动 −35%、xy 抖动 −17%、角度漂移 −15%、yaw 抖动 −23%，重投影（2D 一致性）
+  与骨长波动都没有变差。已设为默认（`smoothing.zero_phase_world=true`，`false` 可回滚）。
+- **二阶时域项不采纳**：z 抖动只降 4~8%，却把 xy 抖动抬高 8~12%、角度漂移抬高 5~13%。
+  原因是 x/y 有 2D 观测、z 又被骨长与 2D 投影长度钉死，加速度残差最终只能靠"改 x/y"来满足。
+  实现保留（`ik_fit.acceleration_weight`，默认 0），只作为极端抖动素材的可选旋钮。
+- **符号先验的代价要看清**：它把重投影从 12.4 px 降到 6.95 px、骨长 CV 从 0.047 降到 0.032
+  （几何自洽性明显更好），但 z 抖动翻倍 —— 因为带符号先验的骨段被排除在一阶时域项之外
+  （避免"踢腿慢半拍"）。所以它仍是**可选**项，不设为默认；抖动优先的素材建议只用零相位。
+- **VideoPose3D（`--depth-sign-mode model`）确实能跑通且有效**：导出权重后 `mode=model`、
+  自校准一致率 **85%（passed）**、覆盖 300 帧中的 200 帧、1594 个骨段、耗时 123 ms；
+  相比 `temporal` 档，符号翻转从 42 再降到 **13**（相对无先验基线 −79%，远超 §2.2 的 ≥50% 判据）、
+  重投影 12.39 → 9.48 px、角度漂移 1.91 → 1.62°、xy 抖动略降。代价仍是 z 抖动（0.0033 → 0.0079 m，
+  即"省掉一阶时域项"换来的方向正确性）。
+  结论：**它值得用，但用途是"修方向/压翻转"，不是"更顺滑"**；顺滑来自零相位平滑。
+
+
 ### 身体 yaw：宽度比 vs world z 推算（任务 3.4）
 
 两种算法在同一段数据上的对比：

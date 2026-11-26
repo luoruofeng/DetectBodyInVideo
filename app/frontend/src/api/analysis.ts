@@ -265,8 +265,11 @@ export interface FitOptions {
 /** 深度方向先验：单目下每根骨段只剩"Δz 取正还是取负"一个比特。 */
 export interface DepthSignOptions {
   enabled?: boolean
-  /** temporal = 用世界坐标 z 做时序一致性（零新增依赖）；model = 需下载 ONNX 权重 */
-  mode?: 'temporal' | 'model'
+  /**
+   * auto = 有权重用抬升模型、无权重退回 temporal（后端解析）；
+   * temporal = 用世界坐标 z 做时序一致性（零新增依赖）；model = 需下载 ONNX 权重
+   */
+  mode?: 'auto' | 'temporal' | 'model'
   window?: number
   min_agreement?: number
   /** model 后端的抬升器权重路径；留空自动搜 models/<lifter>-h36m.onnx */

@@ -703,9 +703,14 @@ def _analyze(
     from app.backend.pipeline import AnalysisOptions, analyze_video
 
     result = analyze_video(path, options=AnalysisOptions(postprocess=options))
-    probe = result.sampling
-    width = getattr(probe, "display_width", 0) or 1080
-    height = getattr(probe, "display_height", 0) or 1920
+    plan = result.sampling
+    # 采样计划里没有画幅，指标又要按像素算（重投影误差），所以直接读一遍容器。
+    import cv2  # noqa: PLC0415
+
+    capture = cv2.VideoCapture(str(path))
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1080
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0) or 1920
+    capture.release()
     fit = getattr(result.postprocess, "fit", None)
     extra = {
         "engine": result.selection.engine,
@@ -722,7 +727,7 @@ def _analyze(
         result.postprocess.frames,
         int(width),
         int(height),
-        float(result.sampling.fps or 30.0),
+        float(getattr(plan, "effective_fps", 0.0) or 30.0),
         extra,
     )
 
@@ -745,6 +750,10 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
         sparsity = getattr(args, "direction_sparsity", 0.0)
         if sparsity and hasattr(postprocess.ik_fit, "depth_sparsity_weight"):
             fit_update["depth_sparsity_weight"] = float(sparsity)
+        # 二阶（加速度）时域约束的 A/B：默认值随 FitConfig 走，显式传入才覆盖
+        accel = getattr(args, "accel_weight", None)
+        if accel is not None and hasattr(postprocess.ik_fit, "acceleration_weight"):
+            fit_update["acceleration_weight"] = float(accel)
         # 头部专项 A/B：关掉后 head_forward_* 应当明显劣化（回到"直立也有几厘米前探"）
         if getattr(args, "no_head_depth", False) and hasattr(postprocess.ik_fit, "head_depth"):
             fit_update["head_depth"] = postprocess.ik_fit.head_depth.model_copy(
@@ -766,6 +775,10 @@ def build_postprocess_config(args: argparse.Namespace, *, stride: int, fps: floa
         smoothing = smoothing.model_copy(update=updates)
     if args.no_smoothing:
         smoothing = smoothing.model_copy(update={"method": "none"})
+    # 零相位（前向+后向）世界点平滑的 A/B
+    zero_phase = getattr(args, "zero_phase", None)
+    if zero_phase is not None and hasattr(smoothing, "zero_phase_world"):
+        smoothing = smoothing.model_copy(update={"zero_phase_world": bool(zero_phase)})
     mode = getattr(args, "depth_sign_mode", None)
     if getattr(args, "depth_sign", False) and hasattr(postprocess, "depth_sign"):
         update: dict[str, Any] = {"enabled": True}
@@ -1143,6 +1156,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="§4 深度稀疏项权重（0 = 关闭）；默认关闭，只在扫描时打开",
+    )
+    parser.add_argument(
+        "--accel-weight",
+        type=float,
+        default=None,
+        help="二阶（加速度）时域约束权重；不传则用 FitConfig 默认值。0 = 关闭",
+    )
+    parser.add_argument(
+        "--zero-phase",
+        dest="zero_phase",
+        action="store_true",
+        default=None,
+        help="world 世界点那趟平滑改成零相位（前向+后向）",
+    )
+    parser.add_argument(
+        "--no-zero-phase",
+        dest="zero_phase",
+        action="store_false",
+        help="强制关闭零相位平滑",
     )
     parser.add_argument(
         "--write-labels",

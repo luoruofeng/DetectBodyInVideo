@@ -119,8 +119,10 @@ class Settings(BaseSettings):
     depth_sign_enabled: bool = Field(
         False, description="深度符号先验默认开关（DETECT_BODY_DEPTH_SIGN_ENABLED）"
     )
-    depth_sign_mode: Literal["temporal", "model"] = Field(
-        "temporal", description="深度符号先验后端：temporal 零依赖 / model 需 ONNX 权重"
+    depth_sign_mode: Literal["auto", "temporal", "model"] = Field(
+        "auto",
+        description="深度符号先验后端：auto 有权重就用 model、没有就 temporal；"
+        "temporal 零依赖 / model 需 ONNX 权重（VideoPose3D 等，缺失时自动退回 temporal）",
     )
     lifter: Literal["videopose3d", "motionbert", "agformer"] = Field(
         "videopose3d",
